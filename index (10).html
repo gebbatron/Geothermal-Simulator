@@ -1,0 +1,1965 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Geothermal Simulator — EGS & Closed-Loop</title>
+  <meta name="description" content="Interactive geothermal energy simulator for Enhanced Geothermal Systems (EGS) and closed-loop systems. Validated against Eavor-Lite field data." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { margin: 0; padding: 0; background: #f3f4f6; font-family: system-ui, -apple-system, sans-serif; }
+    #root { min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Dependencies loaded in order: React, prop-types, Recharts, Three.js, Babel -->
+  <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prop-types@15.8.1/prop-types.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/recharts@2.12.7/umd/Recharts.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useMemo } = React;
+    const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } = Recharts;
+
+
+// =============================================================
+// SIMULATION ENGINE
+// =============================================================
+
+function runSimulation(params) {
+  var dp = params.depthVertical, ll = params.lateralLength, nl = params.numLaterals;
+  var rw = params.wellboreRadius, flowTotal = params.flowRate, Tin = params.inletTemp;
+  var Tsurf = params.surfaceTemp, grad = params.geoGradient;
+  var kr = params.rockThermalCond, rhoR = params.rockDensity, cpR = params.rockHeatCapacity;
+  var krVert = params.rockThermalCondVert || kr * 0.5; // overburden shales typically ~half lateral k
+  var cpF = params.fluidHeatCapacity, yrs = params.years;
+  var alpha = kr / (rhoR * cpR);
+  var alphaVert = krVert / (rhoR * cpR);
+  var flowLat = flowTotal / nl;
+  var TrockDepth = Tsurf + (grad / 1000) * dp;
+  var nOutVert = 30, outVertDx = dp / nOutVert, r_warmup = 0.35;
+  var thermalMassPerM = Math.PI * (r_warmup * r_warmup - rw * rw) * rhoR * cpR;
+  var outVertNodes = [];
+  for (var ov = 0; ov < nOutVert; ov++) {
+    var dov = dp * (1 - (ov + 0.5) / nOutVert);
+    outVertNodes.push({ depth: dov, Tvirgin: Tsurf + (grad / 1000) * dov, Twall: Tsurf + (grad / 1000) * dov });
+  }
+  var nInVert = 20, inVertDx = dp / nInVert, inVertNodes = [];
+  for (var iv = 0; iv < nInVert; iv++) {
+    var dIn = ((iv + 0.5) / nInVert) * dp;
+    inVertNodes.push({ depth: dIn, Tvirgin: Tsurf + (grad / 1000) * dIn, Qext: 0 });
+  }
+  var Rcasing = 0.40, secPerDay = 86400, totalSec = yrs * 365.25 * secPerDay;
+  var Tamb = params.ambientTemp; // mean annual ambient for ORC
+  var seasonAmp = params.seasonalAmp || 0; // half-amplitude of seasonal swing °C
+  var timeSteps = [], t = 0;
+  while (t < totalSec) {
+    var dt;
+    if (t < 1 * secPerDay) dt = 1 * 3600; else if (t < 7 * secPerDay) dt = 4 * 3600; else if (t < 30 * secPerDay) dt = 12 * 3600;
+    else if (t < 180 * secPerDay) dt = secPerDay; else if (t < 730 * secPerDay) dt = 3 * secPerDay;
+    else dt = 7 * secPerDay;
+    t += dt; if (t > totalSec) t = totalSec; timeSteps.push(t);
+  }
+  var results = [];
+  for (var si = 0; si < timeSteps.length; si++) {
+    var tNow = timeSteps[si], dtStep = (si === 0) ? tNow : tNow - timeSteps[si - 1];
+    var rEff = Math.max((Math.PI / 2) * Math.sqrt(alpha * Math.max(tNow, 3600)), rw * 2);
+    var lnTerm = Math.log(rEff / rw), fluidTemp = Tin;
+    // Inlet vertical uses overburden rock k
+    var rEffVert = Math.max((Math.PI / 2) * Math.sqrt(alphaVert * Math.max(tNow, 3600)), rw * 2);
+    var lnTermVert = Math.log(rEffVert / rw);
+    var Rtot_in = lnTermVert / (2 * Math.PI * krVert) + Rcasing;
+    for (var i1 = 0; i1 < nInVert; i1++) {
+      var nd = inVertNodes[i1];
+      var Vrock_in = Math.PI * (rEffVert * rEffVert - rw * rw) * inVertDx;
+      var Twall_in = Math.max(Math.min(nd.Tvirgin - nd.Qext / (rhoR * cpR * Vrock_in), nd.Tvirgin), Tin);
+      var q_in = (Twall_in - fluidTemp) / Rtot_in * inVertDx;
+      var dTf_in = q_in / (flowTotal * cpF);
+      if (dTf_in > 0) dTf_in = Math.min(dTf_in, (Twall_in - fluidTemp) * 0.85);
+      else dTf_in = Math.max(dTf_in, (Twall_in - fluidTemp) * 0.85);
+      fluidTemp += dTf_in; nd.Qext += q_in * dtStep;
+    }
+    var expArg = (2 * Math.PI * kr * ll) / (flowLat * cpF * lnTerm);
+    var latExitTemp = TrockDepth - (TrockDepth - fluidTemp) / Math.exp(expArg);
+    fluidTemp = latExitTemp;
+    // Outlet vertical: time-dependent R_outward using overburden rock conductivity
+    var rEff_out = Math.max((Math.PI / 2) * Math.sqrt(alphaVert * Math.max(tNow, 3600)), r_warmup * 1.2);
+    var R_outward = Math.log(rEff_out / r_warmup) / (2 * Math.PI * krVert);
+    R_outward = Math.max(R_outward, 0.05); // small physical floor
+    R_outward = Math.min(R_outward, Rcasing * 2); // cap: sustained heat loss to far-field
+    var thermalMassNow = Math.PI * (Math.min(rEff_out, r_warmup * 3) * Math.min(rEff_out, r_warmup * 3) - rw * rw) * rhoR * cpR;
+    var Ui = 1 / Rcasing, Uo = 1 / R_outward, Utot = Ui + Uo;
+    var expFout = Math.exp(-dtStep / (thermalMassNow / Utot));
+    for (var i3 = 0; i3 < nOutVert; i3++) {
+      var nd3 = outVertNodes[i3];
+      var Twall_ss = (fluidTemp * Ui + nd3.Tvirgin * Uo) / Utot;
+      var Twall_old = nd3.Twall;
+      nd3.Twall = Math.max(Twall_ss + (Twall_old - Twall_ss) * expFout, nd3.Tvirgin);
+      fluidTemp -= (fluidTemp - nd3.Twall) / Rcasing * outVertDx / (flowTotal * cpF);
+    }
+    var outT = Math.min(fluidTemp, latExitTemp), dTout = outT - Tin;
+    var thMW = (flowTotal * cpF * Math.max(dTout, 0)) / 1e6;
+    var days = tNow / secPerDay, yr = tNow / (365.25 * secPerDay);
+    // ORC rejects heat to ambient air via cooling tower
+    // Ambient varies seasonally: T_amb + amplitude * cos(2π(t - t_peak)/year)
+    // Peak heat (cos=+1) at day ~200 (mid-July NH). Cold at day ~15 (mid-Jan).
+    var dayOfYear = (days % 365.25);
+    var seasonalT = Tamb + seasonAmp * Math.cos(2 * Math.PI * (dayOfYear - 200) / 365.25);
+    var Trej = seasonalT + 10; // + cooling tower approach
+    var carnot = Math.max(1 - (Trej + 273.15) / (Math.max(outT, Trej + 1) + 273.15), 0);
+    var eMW = Math.max(thMW * carnot * 0.5 - thMW * 0.02, 0);
+    var label = days < 1 ? Math.round(days * 24) + "h" : days < 100 ? Math.round(days) + "d" : yr < 2 ? (Math.round(yr * 12 * 10) / 10) + "mo" : (Math.round(yr * 10) / 10) + "yr";
+    results.push({ timeSec: tNow, days: Math.round(days * 10) / 10, year: yr, timeLabel: label,
+      outletTemp: Math.round(outT * 100) / 100, deltaT: Math.round(dTout * 100) / 100,
+      thermalMW: Math.round(thMW * 1000) / 1000, netElectricMW: Math.round(eMW * 1000) / 1000,
+      latExitTemp: Math.round(latExitTemp * 100) / 100, outletVertLoss: Math.round((latExitTemp - outT) * 100) / 100 });
+  }
+  return results;
+}
+
+// =============================================================
+// EGS SIMULATION ENGINE (Fervo-style fracture heat exchange)
+// =============================================================
+// Key difference: heat is extracted through propped hydraulic fractures 
+// between injection and production wells, not sealed laterals.
+// Model: 1D advection through fracture network with conductive heat 
+// transfer from rock matrix (Gringarten et al., 1975; Bodvarsson, 1969).
+
+function runEGSSimulation(params) {
+  var dp = params.depthVertical, ll = params.lateralLength;
+  var rw = params.wellboreRadius, Tin = params.inletTemp;
+  var Tsurf = params.surfaceTemp, grad = params.geoGradient;
+  var kr = params.rockThermalCond, rhoR = params.rockDensity, cpR = params.rockHeatCapacity;
+  var cpF = params.fluidHeatCapacity, yrs = params.years;
+  var alpha = kr / (rhoR * cpR);
+  
+  // EGS well pattern: alternating injector-producer in wine-rack pattern
+  // Simulation perspective: one producer well receiving flow from both sides
+  var nInj = params.numInjectors || 3;
+  var nProd = params.numProducers || 2;
+  var nBenches = params.numBenches || 1;
+  var benchSpacing = params.benchSpacing || 215; // m between benches
+  var clusterSpacing = params.clusterSpacing || 9;
+  // Stages derived from lateral length / cluster spacing (this is how it works in practice)
+  var nStages = Math.max(Math.floor(ll / clusterSpacing), 1);
+  var fracHalfLength = params.fracHalfLength || 200;
+  var fracHeight = params.fracHeight || 170;
+  var wellSpacingH = params.wellSpacingH || 150;
+  var wellSpacingV = params.wellSpacingV || 60;
+  var fluidLossFrac = params.fluidLossFrac || 0.004;
+  var injWHP_psi = params.injWHP_psi || 2150;
+  var prodWHP_psi = 350; // typical production WHP
+  
+  // Production rate per producer well (what Fervo reports: 95 kg/s at Cape)
+  var flowProd = params.flowRate;
+  
+  // In alternating pattern, each interior producer receives flow from 
+  // injectors on both sides. Injection rate per injector = flowProd * nProd / nInj
+  // For 3inj/2prod: each injector pumps (95*2)/3 = 63 kg/s
+  var flowPerInj = flowProd * nProd / nInj;
+  
+  // Total field injection rate (one bench)
+  var totalInjRate = flowPerInj * nInj;
+  
+  // Fracture geometry per producer:
+  // Each producer receives flow through fractures from injector wells.
+  // Effective fracture count serving one producer = nStages * (nInj/nProd)
+  // but fractures from each injector only extend partway to producer.
+  // Simpler: each producer has nStages fracture stages of its own,
+  // and receives flow through fractures connecting to adjacent injectors.
+  // The heat exchange area per producer = nStages * 2 * fracHalfLength * fracHeight * 2 faces
+  var fracSurfaceArea = 2 * fracHalfLength * fracHeight; // one face of one frac, m²
+  var effectiveFracs = nStages; // fracs per producer lateral
+  var flowPerFrac = flowProd / effectiveFracs;
+  
+  var TrockDepth = Tsurf + (grad / 1000) * dp;
+  
+  // Injection vertical nodes (fluid descending in injector)
+  var nInVert = 15, inVertDx = dp / nInVert;
+  var inVertNodes = [];
+  for (var iv = 0; iv < nInVert; iv++) {
+    var dIn = ((iv + 0.5) / nInVert) * dp;
+    inVertNodes.push({ depth: dIn, Tvirgin: Tsurf + (grad / 1000) * dIn, Qext: 0 });
+  }
+  // Production vertical nodes (hot fluid ascending)
+  var nOutVert = 15, outVertDx = dp / nOutVert, r_warmup = 0.35;
+  var outVertNodes = [];
+  for (var ov = 0; ov < nOutVert; ov++) {
+    var dov = dp * (1 - (ov + 0.5) / nOutVert);
+    outVertNodes.push({ depth: dov, Tvirgin: Tsurf + (grad / 1000) * dov, Twall: Tsurf + (grad / 1000) * dov });
+  }
+  
+  var Rcasing = 0.40, secPerDay = 86400, totalSec = yrs * 365.25 * secPerDay;
+  var Tamb = params.ambientTemp;
+  var seasonAmp = params.seasonalAmp || 0;
+  
+  // Fracture thermal depletion state (J/m² cumulative extracted)
+  var fracQext = 0;
+  
+  // Parasitic pump power: pressure differential × injection flow / efficiency
+  // dP = injWHP - prodWHP (simplified; in reality BHP matters but WHP is what's controlled)
+  var dP_psi = injWHP_psi - prodWHP_psi;
+  var dP_Pa = dP_psi * 6894.76;
+  var pumpEff = 0.75;
+  // Pump power for ALL injectors in the bench, attributed per producer
+  var pumpPower_MW_perProducer = (dP_Pa * totalInjRate / 1000) / (pumpEff * 1e6) / nProd;
+  // Scale for multi-bench (each bench independent)
+  // pumpPower_MW_perProducer stays the same since it's already per-producer
+  
+  var timeSteps = [], t = 0;
+  while (t < totalSec) {
+    var dt;
+    if (t < 7 * secPerDay) dt = 4 * 3600; else if (t < 30 * secPerDay) dt = 12 * 3600;
+    else if (t < 180 * secPerDay) dt = secPerDay; else if (t < 730 * secPerDay) dt = 3 * secPerDay;
+    else dt = 7 * secPerDay;
+    t += dt; if (t > totalSec) t = totalSec; timeSteps.push(t);
+  }
+  
+  var results = [];
+  for (var si = 0; si < timeSteps.length; si++) {
+    var tNow = timeSteps[si], dtStep = (si === 0) ? tNow : tNow - timeSteps[si - 1];
+    var rEff = Math.max((Math.PI / 2) * Math.sqrt(alpha * Math.max(tNow, 3600)), rw * 2);
+    
+    // === INJECTION VERTICAL: fluid descends in injector well ===
+    // Flow rate in injector vertical = flowPerInj
+    var fluidTemp = Tin;
+    var Rtot_in = Math.log(rEff / rw) / (2 * Math.PI * kr) + Rcasing;
+    for (var i1 = 0; i1 < nInVert; i1++) {
+      var nd = inVertNodes[i1];
+      var Vrock_in = Math.PI * (rEff * rEff - rw * rw) * inVertDx;
+      var Twall_in = Math.max(Math.min(nd.Tvirgin - nd.Qext / (rhoR * cpR * Vrock_in), nd.Tvirgin), Tin);
+      var q_in = (Twall_in - fluidTemp) / Rtot_in * inVertDx;
+      var dTf_in = q_in / (flowPerInj * cpF);
+      if (dTf_in > 0) dTf_in = Math.min(dTf_in, (Twall_in - fluidTemp) * 0.85);
+      fluidTemp += dTf_in; nd.Qext += q_in * dtStep;
+    }
+    // fluidTemp is now the injection BH temperature
+    var fluidTempPreFrac = fluidTemp;
+    
+    // === FRACTURE HEAT EXCHANGE ===
+    // Fluid flows from injector BH through propped fractures to producer
+    // Thermal penetration into rock matrix from fracture faces
+    var thermPen = Math.sqrt(4 * alpha * tNow);
+    
+    // The rock volume available to each fracture stage depends on time:
+    // Early: thermal front hasn't reached adjacent fractures → rock on both sides
+    // Late: adjacent fracture thermal fronts merge → limited to inter-fracture slab
+    var halfSpacing = clusterSpacing / 2;
+    var penPerSide = Math.min(thermPen, halfSpacing); // capped at half cluster spacing
+    
+    // Inter-bench thermal interference
+    if (nBenches > 1 && benchSpacing > 0) {
+      penPerSide = Math.min(penPerSide, benchSpacing * 0.5);
+    }
+    
+    // Effective rock volume per unit fracture area (m³/m² of fracture face)
+    // Before breakthrough: penetration growing on both sides
+    // After breakthrough: fixed slab thickness = clusterSpacing
+    var rockThickness = penPerSide * 2; // total rock accessed (both sides of fracture)
+    if (thermPen > halfSpacing) rockThickness = clusterSpacing; // slab fully tapped
+    
+    // After inter-fracture breakthrough, heat replenishment from far-field rock
+    // The stimulated zone (all fractures) draws heat from the larger rock mass.
+    // Far-field thermal penetration extends beyond fracture tips with √t.
+    // Effective additional thickness from far-field conduction:
+    if (thermPen > halfSpacing) {
+      // Far-field penetration beyond the stimulated zone boundary
+      var farFieldPen = thermPen - halfSpacing;
+      // This adds rock volume proportional to the perimeter of the stimulated zone
+      // Ratio: perimeter-accessible volume / fracture-face volume
+      // For a fracture 200m × 170m, perimeter ≈ 2×(200+170) = 740m
+      // Face area = 200×170 = 34,000 m²
+      // Far-field contribution per unit face area ≈ farFieldPen × perimeterRatio
+      var perimeterRatio = 2 * (fracHalfLength + fracHeight) / (fracHalfLength * fracHeight);
+      rockThickness += farFieldPen * perimeterRatio * fracHalfLength * 0.3;
+    }
+    
+    // Rock temperature at fracture face, accounting for cumulative depletion
+    var Trock_frac = TrockDepth - fracQext / (rhoR * cpR * Math.max(rockThickness, 0.1));
+    Trock_frac = Math.max(Trock_frac, Tin);
+    
+    // Heat transfer: Gringarten-style parallel fracture model
+    // For well-connected fractures, the resistance is dominated by conduction
+    // through the rock matrix perpendicular to the fracture face.
+    // h = k / δ where δ is the effective conduction distance
+    // Before breakthrough: δ = thermPen/2 (average distance to thermal front)
+    // After breakthrough: δ = halfSpacing (conduction from midpoint of slab)
+    var condDist = thermPen < halfSpacing ? thermPen * 0.5 : halfSpacing;
+    var h_frac = kr / Math.max(condDist, 0.01);
+    var R_frac_per_area = 1 / h_frac;
+    
+    // Exponential heat exchange across fracture surfaces
+    // Each fracture: T_exit = T_rock - (T_rock - T_in) * exp(-UA/(m*cp))
+    var expArgFrac = fracSurfaceArea * 2 / (flowPerFrac * cpF * R_frac_per_area);
+    expArgFrac = Math.min(expArgFrac, 20);
+    var fracExitTemp = Trock_frac - (Trock_frac - fluidTemp) / Math.exp(expArgFrac);
+    
+    // Update cumulative energy extraction per unit fracture area
+    // Must track actual energy carried by fluid, not theoretical rock supply
+    var actualQperFrac = flowPerFrac * cpF * (fracExitTemp - fluidTempPreFrac); // W per frac
+    var actualQperArea = actualQperFrac / (fracSurfaceArea * 2); // W/m² (both faces)
+    fracQext += actualQperArea * dtStep; // J/m²
+    
+    fluidTemp = fracExitTemp;
+    
+    // === PRODUCTION VERTICAL: hot fluid rises to surface ===
+    // Flow rate in production vertical = flowProd
+    var rEff_out = Math.max((Math.PI / 2) * Math.sqrt(alpha * Math.max(tNow, 3600)), r_warmup * 1.2);
+    var R_outward = Math.log(rEff_out / r_warmup) / (2 * Math.PI * kr);
+    R_outward = Math.max(R_outward, Rcasing); // floor: outward resistance can't be less than casing
+    var thermalMassNow = Math.PI * (Math.min(rEff_out, r_warmup * 3) * Math.min(rEff_out, r_warmup * 3) - rw * rw) * rhoR * cpR;
+    var Ui = 1 / Rcasing, Uo = 1 / R_outward, Utot = Ui + Uo;
+    var expFout = Math.exp(-dtStep / (thermalMassNow / Utot));
+    for (var i3 = 0; i3 < nOutVert; i3++) {
+      var nd3 = outVertNodes[i3];
+      var Twall_ss = (fluidTemp * Ui + nd3.Tvirgin * Uo) / Utot;
+      nd3.Twall = Math.max(Twall_ss + (nd3.Twall - Twall_ss) * expFout, nd3.Tvirgin);
+      fluidTemp -= (fluidTemp - nd3.Twall) / Rcasing * outVertDx / (flowProd * cpF);
+    }
+    
+    // === POWER CALCULATIONS (per producer) ===
+    var outT = Math.min(fluidTemp, fracExitTemp);
+    var dTout = outT - Tin;
+    var effFlow = flowProd * (1 - fluidLossFrac);
+    var thMW = (effFlow * cpF * Math.max(dTout, 0)) / 1e6;
+    var days = tNow / secPerDay, yr = tNow / (365.25 * secPerDay);
+    var dayOfYear = (days % 365.25);
+    var seasonalT = Tamb + seasonAmp * Math.cos(2 * Math.PI * (dayOfYear - 200) / 365.25);
+    var Trej = seasonalT + 10;
+    var carnot = Math.max(1 - (Trej + 273.15) / (Math.max(outT, Trej + 1) + 273.15), 0);
+    // Gross electric from ORC per producer
+    var grossMWe = thMW * carnot * 0.5;
+    // Net = gross - parasitic pump - ORC parasitic (~2% of thermal)
+    var eMW = Math.max(grossMWe - pumpPower_MW_perProducer - thMW * 0.02, 0);
+    
+    var label = days < 1 ? Math.round(days * 24) + "h" : days < 100 ? Math.round(days) + "d" : yr < 2 ? (Math.round(yr * 12 * 10) / 10) + "mo" : (Math.round(yr * 10) / 10) + "yr";
+    results.push({ timeSec: tNow, days: Math.round(days * 10) / 10, year: yr, timeLabel: label,
+      outletTemp: Math.round(outT * 100) / 100, deltaT: Math.round(dTout * 100) / 100,
+      thermalMW: Math.round(thMW * 1000) / 1000, netElectricMW: Math.round(eMW * 1000) / 1000,
+      grossElectricMW: Math.round(grossMWe * 1000) / 1000,
+      pumpMW: Math.round(pumpPower_MW_perProducer * 1000) / 1000,
+      latExitTemp: Math.round(fracExitTemp * 100) / 100, outletVertLoss: Math.round((fracExitTemp - outT) * 100) / 100 });
+  }
+  return results;
+}
+
+const LOCATIONS = [
+  { id: 'alberta', label: 'Alberta, Canada', surfaceTemp: 3.5, ambientTemp: 5, seasonalAmp: 20 },
+  { id: 'saskatchewan', label: 'Saskatchewan, Canada', surfaceTemp: 2.0, ambientTemp: 3, seasonalAmp: 22 },
+  { id: 'bc', label: 'British Columbia, Canada', surfaceTemp: 4.0, ambientTemp: 6, seasonalAmp: 12 },
+  { id: 'iceland', label: 'Iceland', surfaceTemp: 4.5, ambientTemp: 5, seasonalAmp: 8 },
+  { id: 'bavaria', label: 'Bavaria, Germany', surfaceTemp: 8.5, ambientTemp: 10, seasonalAmp: 11 },
+  { id: 'utah', label: 'Utah, USA', surfaceTemp: 11.0, ambientTemp: 13, seasonalAmp: 14 },
+  { id: 'nevada', label: 'Nevada, USA', surfaceTemp: 10.5, ambientTemp: 18, seasonalAmp: 16 },
+  { id: 'texas', label: 'Texas (Permian), USA', surfaceTemp: 20.0, ambientTemp: 20, seasonalAmp: 15 },
+  { id: 'california', label: 'California (Imperial), USA', surfaceTemp: 23.0, ambientTemp: 28, seasonalAmp: 14 },
+  { id: 'japan', label: 'Japan (Tohoku)', surfaceTemp: 11.0, ambientTemp: 13, seasonalAmp: 13 },
+  { id: 'kenya', label: 'Kenya (Rift Valley)', surfaceTemp: 20.0, ambientTemp: 22, seasonalAmp: 2 },
+  { id: 'norway', label: 'Norway', surfaceTemp: 5.0, ambientTemp: 6, seasonalAmp: 12 },
+  { id: 'france', label: 'France (Paris Basin)', surfaceTemp: 11.0, ambientTemp: 13, seasonalAmp: 9 },
+  { id: 'nz', label: 'New Zealand', surfaceTemp: 12.5, ambientTemp: 14, seasonalAmp: 7 },
+  { id: 'australia', label: 'Australia (Cooper Basin)', surfaceTemp: 21.0, ambientTemp: 26, seasonalAmp: 14 },
+];
+
+const PRESETS = {
+  eavor_lite: { label: "Eavor-Lite", location: 'alberta', architecture: 'utube', systemType: 'closedloop', depthVertical: 2400, lateralLength: 1700, numLaterals: 2, wellboreRadius: 0.079, flowRate: 5.76, inletTemp: 24, geoGradient: 31.0, rockThermalCond: 4.64, rockThermalCondVert: 2.25, rockDensity: 2650, rockHeatCapacity: 850, fluidHeatCapacity: 4180, years: 2 },
+  geretsried: { label: "Geretsried", location: 'bavaria', architecture: 'colocated', systemType: 'closedloop', depthVertical: 4500, lateralLength: 3250, numLaterals: 12, wellboreRadius: 0.105, flowRate: 45, inletTemp: 40, geoGradient: 33.7, rockThermalCond: 3.0, rockThermalCondVert: 2.0, rockDensity: 2700, rockHeatCapacity: 900, fluidHeatCapacity: 4180, years: 30 },
+  project_cape: { label: "Project Cape", location: 'utah', architecture: 'egs', systemType: 'egs', depthVertical: 3960, lateralLength: 1430, wellboreRadius: 0.108, flowRate: 95, inletTemp: 30, geoGradient: 46.5, rockThermalCond: 3.0, rockDensity: 2700, rockHeatCapacity: 900, fluidHeatCapacity: 4180, years: 30, numStages: 47, clusterSpacing: 9, fracHalfLength: 200, fracHeight: 170, wellSpacingH: 150, wellSpacingV: 60, fluidLossFrac: 0.004, numInjectors: 3, numProducers: 2, numBenches: 2, benchSpacing: 215, injWHP_psi: 2150 },
+  project_red: { label: "Project Red", location: 'nevada', architecture: 'egs', systemType: 'egs', depthVertical: 2350, lateralLength: 990, wellboreRadius: 0.108, flowRate: 63, inletTemp: 25, geoGradient: 50, rockThermalCond: 2.8, rockDensity: 2650, rockHeatCapacity: 880, fluidHeatCapacity: 4180, years: 30, numStages: 30, clusterSpacing: 9, fracHalfLength: 150, fracHeight: 140, wellSpacingH: 150, wellSpacingV: 60, fluidLossFrac: 0.004, numInjectors: 1, numProducers: 1, numBenches: 1, benchSpacing: 0, injWHP_psi: 2000 },
+};
+
+const PARAM_CONFIG_CLOSED = [
+  { key: "depthVertical", label: "Vertical Depth", unit: "m", min: 1000, max: 6000, step: 100 },
+  { key: "lateralLength", label: "Lateral Length", unit: "m", min: 500, max: 8000, step: 100 },
+  { key: "numLaterals", label: "Num Laterals", unit: "", min: 1, max: 12, step: 1 },
+  { key: "wellboreRadius", label: "Wellbore Radius", unit: "m", min: 0.05, max: 0.15, step: 0.005 },
+  { key: "flowRate", label: "Total Flow Rate", unit: "kg/s", min: 1, max: 100, step: 0.5 },
+  { key: "inletTemp", label: "Inlet Temp", unit: "°C", min: 5, max: 50, step: 1 },
+  { key: "ambientTemp", label: "Ambient Temp", unit: "°C", min: -10, max: 40, step: 1 },
+  { key: "geoGradient", label: "Gradient", unit: "°C/km", min: 15, max: 60, step: 0.5 },
+  { key: "rockThermalCond", label: "Lateral Rock k", unit: "W/mK", min: 1, max: 6, step: 0.1 },
+  { key: "rockThermalCondVert", label: "Vertical Rock k", unit: "W/mK", min: 0.5, max: 4, step: 0.05 },
+  { key: "rockDensity", label: "Rock ρ", unit: "kg/m³", min: 2200, max: 3000, step: 50 },
+  { key: "rockHeatCapacity", label: "Rock Cp", unit: "J/kgK", min: 700, max: 1100, step: 25 },
+  { key: "fluidHeatCapacity", label: "Fluid Cp", unit: "J/kgK", min: 3500, max: 4500, step: 50 },
+  { key: "years", label: "Sim Length", unit: "yr", min: 1, max: 40, step: 1 },
+];
+
+const PARAM_CONFIG_EGS = [
+  { key: "depthVertical", label: "Vertical Depth", unit: "m", min: 1000, max: 6000, step: 100 },
+  { key: "lateralLength", label: "Lateral Length", unit: "m", min: 500, max: 3000, step: 50 },
+  { key: "numInjectors", label: "Injectors / bench", unit: "", min: 1, max: 5, step: 1 },
+  { key: "numProducers", label: "Producers / bench", unit: "", min: 1, max: 5, step: 1 },
+  { key: "numBenches", label: "Num Benches", unit: "", min: 1, max: 4, step: 1 },
+  { key: "benchSpacing", label: "Bench Spacing", unit: "m", min: 0, max: 400, step: 5 },
+  { key: "clusterSpacing", label: "Cluster Spacing", unit: "m", min: 5, max: 15, step: 0.5 },
+  { key: "fracHalfLength", label: "Frac Half-Length", unit: "m", min: 50, max: 400, step: 10 },
+  { key: "fracHeight", label: "Frac Height", unit: "m", min: 50, max: 300, step: 10 },
+  { key: "wellSpacingH", label: "Well Spacing (H)", unit: "m", min: 60, max: 250, step: 5 },
+  { key: "wellSpacingV", label: "Well Spacing (V)", unit: "m", min: 30, max: 150, step: 5 },
+  { key: "wellboreRadius", label: "Wellbore Radius", unit: "m", min: 0.05, max: 0.15, step: 0.005 },
+  { key: "flowRate", label: "Prod Rate / well", unit: "kg/s", min: 10, max: 200, step: 1 },
+  { key: "injWHP_psi", label: "Injection WHP", unit: "psi", min: 500, max: 3000, step: 50 },
+  { key: "inletTemp", label: "Injection Temp", unit: "°C", min: 5, max: 50, step: 1 },
+  { key: "ambientTemp", label: "Ambient Temp", unit: "°C", min: -10, max: 40, step: 1 },
+  { key: "geoGradient", label: "Gradient", unit: "°C/km", min: 15, max: 100, step: 0.5 },
+  { key: "rockThermalCond", label: "Rock k", unit: "W/mK", min: 1, max: 6, step: 0.1 },
+  { key: "rockDensity", label: "Rock ρ", unit: "kg/m³", min: 2200, max: 3000, step: 50 },
+  { key: "rockHeatCapacity", label: "Rock Cp", unit: "J/kgK", min: 700, max: 1100, step: 25 },
+  { key: "fluidHeatCapacity", label: "Fluid Cp", unit: "J/kgK", min: 3500, max: 4500, step: 50 },
+  { key: "years", label: "Sim Length", unit: "yr", min: 1, max: 40, step: 1 },
+];
+
+// =============================================================
+// ZOOM CHART
+// =============================================================
+
+function ZoomChart({ data, lines, title, height = 260 }) {
+  const N = data.length, refLeft = useRef(null), refRight = useRef(null);
+  const [domain, setDomain] = useState(null), [selecting, setSelecting] = useState(false);
+  const miniRef = useRef(null), dragRef = useRef(null);
+  const d0 = domain ? domain[0] : 0, d1 = domain ? domain[1] : N - 1;
+  const visibleData = data.slice(d0, d1 + 1);
+  const tickInt = Math.max(Math.floor(visibleData.length / 10), 1);
+  function handleMouseDown(e) { if (e?.activeLabel) { refLeft.current = e.activeLabel; refRight.current = null; setSelecting(true); } }
+  function handleMouseMove(e) { if (selecting && e?.activeLabel) refRight.current = e.activeLabel; }
+  function handleMouseUp() {
+    if (selecting && refLeft.current && refRight.current && refLeft.current !== refRight.current) {
+      let i1 = -1, i2 = -1;
+      for (let i = 0; i < data.length; i++) { if (data[i].timeLabel === refLeft.current) i1 = i; if (data[i].timeLabel === refRight.current) i2 = i; }
+      if (i1 > -1 && i2 > -1) setDomain([Math.min(i1, i2), Math.max(i1, i2)]);
+    }
+    setSelecting(false); refLeft.current = null; refRight.current = null;
+  }
+  function fracToIdx(f) { return Math.round(Math.max(0, Math.min(1, f)) * (N - 1)); }
+  function getMiniX(e) { if (!miniRef.current) return 0; const r = miniRef.current.getBoundingClientRect(); return (e.clientX - r.left) / r.width; }
+  function miniMouseDown(e) {
+    e.preventDefault();
+    const frac = getMiniX(e), frac0 = d0 / (N - 1), frac1 = d1 / (N - 1), thr = 0.015;
+    let type;
+    if (Math.abs(frac - frac0) < thr) type = "left"; else if (Math.abs(frac - frac1) < thr) type = "right";
+    else if (frac >= frac0 && frac <= frac1) type = "move";
+    else { const sp = frac1 - frac0; let a = Math.max(0, frac - sp / 2), b = Math.min(1, a + sp); a = Math.max(0, b - sp); setDomain([fracToIdx(a), fracToIdx(b)]); return; }
+    dragRef.current = { type, startX: frac, origD0: d0, origD1: d1 };
+    function onMove(ev) {
+      if (!dragRef.current) return; const nf = getMiniX(ev), delta = nf - dragRef.current.startX;
+      const oF0 = dragRef.current.origD0 / (N - 1), oF1 = dragRef.current.origD1 / (N - 1); let nd0, nd1;
+      if (dragRef.current.type === "move") { const sp = oF1 - oF0; let a = oF0 + delta, b = oF1 + delta; if (a < 0) { a = 0; b = sp; } if (b > 1) { b = 1; a = 1 - sp; } nd0 = fracToIdx(a); nd1 = fracToIdx(b); }
+      else if (dragRef.current.type === "left") { nd0 = fracToIdx(Math.max(0, Math.min(oF0 + delta, oF1 - 0.02))); nd1 = dragRef.current.origD1; }
+      else { nd0 = dragRef.current.origD0; nd1 = fracToIdx(Math.min(1, Math.max(oF1 + delta, oF0 + 0.02))); }
+      if (nd0 < nd1) setDomain([nd0, nd1]);
+    }
+    function onUp() { dragRef.current = null; window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); }
+    window.addEventListener("mousemove", onMove); window.addEventListener("mouseup", onUp);
+  }
+  const miniStep = Math.max(Math.floor(N / 80), 1);
+  const miniData = data.filter((_, i) => i % miniStep === 0 || i === N - 1);
+  const pctL = (d0 / Math.max(N - 1, 1)) * 100, pctW = Math.max(((d1 - d0) / Math.max(N - 1, 1)) * 100, 1);
+  return (
+    <div className="bg-white border border-gray-200 mb-3">
+      <div className="bg-gray-100 px-3 py-1.5 border-b border-gray-200 flex justify-between items-center">
+        <h3 className="text-gray-700 font-semibold text-xs uppercase">{title}</h3>
+        <div className="flex items-center gap-2">
+          {domain && <button onClick={() => setDomain(null)} className="px-2 py-0.5 text-xs rounded border" style={{borderColor:'#F79130',color:'#F79130',background:'#F7913010'}}>Reset Zoom</button>}
+          <span className="text-gray-400" style={{fontSize:10}}>⇡ Drag to zoom</span>
+        </div>
+      </div>
+      <div className="p-2" style={{userSelect:'none'}}>
+        <ResponsiveContainer width="100%" height={height}>
+          <LineChart data={visibleData} onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} style={{cursor:'crosshair'}}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" /><XAxis dataKey="timeLabel" stroke="#9ca3af" fontSize={9} interval={tickInt} />
+            <YAxis stroke="#9ca3af" fontSize={9} domain={['auto','auto']} /><Tooltip contentStyle={{background:'#fff',border:'1px solid #e5e7eb',borderRadius:4,fontSize:10}} />
+            <Legend wrapperStyle={{fontSize:9}} />{lines.map(l => <Line key={l.key} type="monotone" dataKey={l.key} name={l.name} stroke={l.color} strokeWidth={l.width||2} dot={false} strokeDasharray={l.dash||''} isAnimationActive={false} />)}
+          </LineChart>
+        </ResponsiveContainer>
+        {/* Minimap — always visible */}
+        <div ref={miniRef} onMouseDown={miniMouseDown} style={{position:'relative',height:32,marginTop:4,cursor:'pointer',border:'1px solid #e5e7eb',borderRadius:3,background:'#f9fafb'}}>
+          <div style={{position:'absolute',left:0,top:0,width:`${pctL}%`,height:'100%',background:'#00000008'}} />
+          <div style={{position:'absolute',left:`${pctL+pctW}%`,top:0,right:0,height:'100%',background:'#00000008'}} />
+          <div style={{position:'absolute',left:`${pctL}%`,width:`${pctW}%`,height:'100%',border:'2px solid #53BD2E',borderRadius:2,background:'#53BD2E08'}}>
+            <div style={{position:'absolute',left:-2,top:'50%',transform:'translateY(-50%)',width:4,height:16,background:'#53BD2E',borderRadius:2,cursor:'ew-resize'}} />
+            <div style={{position:'absolute',right:-2,top:'50%',transform:'translateY(-50%)',width:4,height:16,background:'#53BD2E',borderRadius:2,cursor:'ew-resize'}} />
+          </div>
+          <div style={{position:'absolute',inset:0,padding:'2px 4px'}}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={miniData} margin={{top:2,right:2,bottom:2,left:2}}>
+                {lines.map(l => <Line key={l.key} type="monotone" dataKey={l.key} stroke={l.color} strokeWidth={0.8} dot={false} isAnimationActive={false} />)}
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =============================================================
+// MODEL ARCHITECTURE VISUALIZATION
+// =============================================================
+
+function ModelArchitecture({ params }) {
+  const dp = params.depthVertical, ll = params.lateralLength, nl = params.numLaterals;
+  const rw = params.wellboreRadius, Tsurf = params.surfaceTemp, grad = params.geoGradient;
+  const TrockDepth = Tsurf + (grad / 1000) * dp;
+  const alpha = params.rockThermalCond / (params.rockDensity * params.rockHeatCapacity);
+  const r_warmup = 0.35;
+  const isEGS = params.systemType === 'egs';
+
+  // Cross-section of the outlet vertical wellbore
+  function CrossSection() {
+    const W = 560, H = 480;
+    const cx = 230, cy = 200, scale = 120;
+    const rwPx = Math.max(rw * scale / r_warmup, 16);
+    const warmPx = scale;
+    const rEffDay1 = (Math.PI / 2) * Math.sqrt(alpha * 86400);
+    const rEffDay30 = (Math.PI / 2) * Math.sqrt(alpha * 30 * 86400);
+    const rockPx = Math.min(rEffDay30 * scale / r_warmup, warmPx + 50);
+    const outerR = rockPx + 30;
+    const lx = cx + outerR + 20;
+
+    return (
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{maxWidth: W}}>
+        <defs>
+          <marker id="arrR2" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#C04151" /></marker>
+          <marker id="arrO2" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#F79130" /></marker>
+        </defs>
+        <circle cx={cx} cy={cy} r={outerR} fill="#e8ddd0" stroke="#c4b5a0" strokeWidth={1} />
+        <circle cx={cx} cy={cy} r={rockPx} fill="none" stroke="#a89880" strokeWidth={1} strokeDasharray="5 3" />
+        <circle cx={cx} cy={cy} r={warmPx} fill="#f5c882" fillOpacity={0.4} stroke="#e6a040" strokeWidth={2} />
+        <circle cx={cx} cy={cy} r={rwPx} fill="#4a9edd" stroke="#2a6ea0" strokeWidth={2} />
+        {rwPx >= 20 && <text x={cx} y={cy + 4} textAnchor="middle" fontSize="9" fontWeight="700" fill="#fff">FLUID</text>}
+        <line x1={cx + rwPx + 2} y1={cy - 15} x2={cx + warmPx - 2} y2={cy - 15} stroke="#F79130" strokeWidth={2} markerEnd="url(#arrO2)" />
+        <line x1={cx + warmPx + 2} y1={cy + 15} x2={cx + rockPx - 2} y2={cy + 15} stroke="#C04151" strokeWidth={2} markerEnd="url(#arrR2)" />
+        <line x1={cx + rwPx * 0.7} y1={cy + rwPx * 0.7} x2={lx - 4} y2={78} stroke="#2a6ea0" strokeWidth={0.7} strokeDasharray="2 2" />
+        <circle cx={cx + rwPx * 0.7} cy={cy + rwPx * 0.7} r={2} fill="#2a6ea0" />
+        <text x={lx} y={72} fontSize="10" fontWeight="600" fill="#2a6ea0">Fluid (T_fluid)</text>
+        <text x={lx} y={84} fontSize="9" fill="#2a6ea0">Wellbore radius: {(rw * 1000).toFixed(0)}mm ({(rw * 2 * 39.37).toFixed(1)}" ID)</text>
+        <line x1={cx + (rwPx + warmPx) / 2} y1={cy - 15} x2={lx - 4} y2={118} stroke="#F79130" strokeWidth={0.7} strokeDasharray="2 2" />
+        <circle cx={cx + (rwPx + warmPx) / 2} cy={cy - 15} r={2} fill="#F79130" />
+        <text x={lx} y={112} fontSize="10" fontWeight="600" fill="#F79130">R_casing</text>
+        <text x={lx} y={124} fontSize="9" fill="#F79130">Casing + cement: 0.40 m·K/W per m</text>
+        <line x1={cx - warmPx * 0.7} y1={cy - warmPx * 0.7} x2={lx - 4} y2={158} stroke="#c07020" strokeWidth={0.7} strokeDasharray="2 2" />
+        <circle cx={cx - warmPx * 0.7} cy={cy - warmPx * 0.7} r={2} fill="#c07020" />
+        <text x={lx} y={152} fontSize="10" fontWeight="600" fill="#c07020">Warm Zone (T_wall)</text>
+        <text x={lx} y={164} fontSize="9" fill="#c07020">Lumped thermal mass, r = {r_warmup}m</text>
+        <text x={lx} y={176} fontSize="9" fill="#c07020">Casing + cement + near-wellbore rock</text>
+        <line x1={cx + (warmPx + rockPx) / 2} y1={cy + 15} x2={lx - 4} y2={210} stroke="#C04151" strokeWidth={0.7} strokeDasharray="2 2" />
+        <circle cx={cx + (warmPx + rockPx) / 2} cy={cy + 15} r={2} fill="#C04151" />
+        <text x={lx} y={204} fontSize="10" fontWeight="600" fill="#C04151">R_outward(t)</text>
+        <text x={lx} y={216} fontSize="9" fill="#C04151">= ln(r_eff/r_warm) / (2πk) — time-dependent</text>
+        <line x1={cx + outerR * 0.6} y1={cy + outerR * 0.5} x2={lx - 4} y2={254} stroke="#8b7b6f" strokeWidth={0.7} strokeDasharray="2 2" />
+        <circle cx={cx + outerR * 0.6} cy={cy + outerR * 0.5} r={2} fill="#8b7b6f" />
+        <text x={lx} y={248} fontSize="10" fontWeight="600" fill="#6b5b4f">Virgin Rock (T_∞)</text>
+        <text x={lx} y={260} fontSize="9" fill="#8b7b6f">Undisturbed geothermal gradient</text>
+        <g transform="translate(40, 430)">
+          <text x={240} y={-8} textAnchor="middle" fontSize="11" fontWeight="600" fill="#555">Thermal Circuit (per node)</text>
+          <rect x={0} y={5} width={75} height={28} rx={4} fill="#4a9edd" />
+          <text x={37} y={23} textAnchor="middle" fontSize="9" fontWeight="600" fill="#fff">T_fluid</text>
+          <line x1={75} y1={19} x2={98} y2={19} stroke="#F79130" strokeWidth={2} />
+          <rect x={98} y={8} width={36} height={22} rx={2} fill="#fff" stroke="#F79130" strokeWidth={1.5} />
+          <text x={116} y={23} textAnchor="middle" fontSize="8" fontWeight="600" fill="#F79130">R_c</text>
+          <line x1={134} y1={19} x2={155} y2={19} stroke="#F79130" strokeWidth={2} />
+          <rect x={155} y={5} width={75} height={28} rx={4} fill="#f5c882" stroke="#e6a040" strokeWidth={1} />
+          <text x={192} y={23} textAnchor="middle" fontSize="9" fontWeight="600" fill="#8b5e00">T_wall</text>
+          <line x1={230} y1={19} x2={255} y2={19} stroke="#C04151" strokeWidth={2} />
+          <rect x={255} y={8} width={36} height={22} rx={2} fill="#fff" stroke="#C04151" strokeWidth={1.5} />
+          <text x={273} y={23} textAnchor="middle" fontSize="8" fontWeight="600" fill="#C04151">R_o</text>
+          <line x1={291} y1={19} x2={315} y2={19} stroke="#C04151" strokeWidth={2} />
+          <rect x={315} y={5} width={90} height={28} rx={4} fill="#e8ddd0" stroke="#c4b5a0" strokeWidth={1} />
+          <text x={360} y={23} textAnchor="middle" fontSize="9" fontWeight="600" fill="#6b5b4f">T_virgin</text>
+        </g>
+      </svg>
+    );
+  }
+
+  // EGS well pattern schematic — plan view of alternating I/P wells with fractures
+  function EGSWellPattern() {
+    const W = 600, H = 360;
+    const nInj = params.numInjectors || 3, nProd = params.numProducers || 2;
+    const totalWells = nInj + nProd;
+    const wellGap = 65, startX = (W - (totalWells - 1) * wellGap) / 2;
+    const topY = 60, botY = 300;
+    const fracHalf = params.fracHalfLength || 200;
+    const wSpH = params.wellSpacingH || 150;
+    const nStages = Math.floor((params.lateralLength || 1430) / (params.clusterSpacing || 9));
+    // Lay out wells: alternate I-P-I-P-I
+    const wells = [];
+    let pi = 0, ii = 0;
+    for (let w = 0; w < totalWells; w++) {
+      const isInj = (nInj >= nProd) ? (w % 2 === 0) : (w % 2 === 1);
+      if (isInj && ii < nInj) { wells.push({ type: 'inj', x: startX + w * wellGap }); ii++; }
+      else if (!isInj && pi < nProd) { wells.push({ type: 'prod', x: startX + w * wellGap }); pi++; }
+      else if (ii < nInj) { wells.push({ type: 'inj', x: startX + w * wellGap }); ii++; }
+      else { wells.push({ type: 'prod', x: startX + w * wellGap }); pi++; }
+    }
+
+    return (
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{maxWidth: W}}>
+        <defs>
+          <marker id="arrDown" markerWidth="6" markerHeight="6" refX="3" refY="5" orient="auto"><path d="M0,0 L3,6 L6,0 Z" fill="#4a9edd" /></marker>
+          <marker id="arrUp" markerWidth="6" markerHeight="6" refX="3" refY="1" orient="auto"><path d="M0,6 L3,0 L6,6 Z" fill="#F79130" /></marker>
+        </defs>
+        <text x={W/2} y={20} textAnchor="middle" fontSize="11" fontWeight="600" fill="#555">Well Pattern — Plan View (1 bench)</text>
+        <text x={W/2} y={34} textAnchor="middle" fontSize="9" fill="#888">{nInj}I / {nProd}P alternating, {(wSpH * 3.281).toFixed(0)} ft horizontal spacing</text>
+
+        {/* Fracture planes between wells — draw before wells so wells overlay */}
+        {wells.map((w, i) => {
+          if (i === wells.length - 1) return null;
+          const next = wells[i + 1];
+          const midX = (w.x + next.x) / 2;
+          // Show ~8 representative fractures
+          const nShow = 8;
+          return Array.from({length: nShow}).map((_, fi) => {
+            const y = topY + 15 + fi * (botY - topY - 30) / (nShow - 1);
+            return <line key={`f${i}-${fi}`} x1={w.x + 5} y1={y} x2={next.x - 5} y2={y} stroke="#c9a0dd" strokeWidth={1.5} strokeOpacity={0.5} />;
+          });
+        })}
+
+        {/* Wells */}
+        {wells.map((w, i) => (
+          <g key={i}>
+            <line x1={w.x} y1={topY} x2={w.x} y2={botY} stroke={w.type === 'inj' ? '#4a9edd' : '#F79130'} strokeWidth={5} strokeLinecap="round" />
+            {/* Flow arrow */}
+            {w.type === 'inj' ? (
+              <polygon points={`${w.x-4},${topY+30} ${w.x+4},${topY+30} ${w.x},${topY+42}`} fill="#2a6ea0" />
+            ) : (
+              <polygon points={`${w.x-4},${botY-30} ${w.x+4},${botY-30} ${w.x},${botY-42}`} fill="#c06820" />
+            )}
+            {/* Label */}
+            <text x={w.x} y={topY - 8} textAnchor="middle" fontSize="10" fontWeight="700" fill={w.type === 'inj' ? '#2a6ea0' : '#c06820'}>{w.type === 'inj' ? 'INJ' : 'PROD'}</text>
+          </g>
+        ))}
+
+        {/* Spacing annotation */}
+        {wells.length >= 2 && (
+          <g>
+            <line x1={wells[0].x} y1={botY + 15} x2={wells[1].x} y2={botY + 15} stroke="#888" strokeWidth={1} />
+            <line x1={wells[0].x} y1={botY + 10} x2={wells[0].x} y2={botY + 20} stroke="#888" strokeWidth={1} />
+            <line x1={wells[1].x} y1={botY + 10} x2={wells[1].x} y2={botY + 20} stroke="#888" strokeWidth={1} />
+            <text x={(wells[0].x + wells[1].x) / 2} y={botY + 28} textAnchor="middle" fontSize="9" fill="#888">{wSpH}m ({(wSpH * 3.281).toFixed(0)} ft)</text>
+          </g>
+        )}
+
+        {/* Fracture label */}
+        <rect x={W - 170} y={topY + 10} width={155} height={50} rx={3} fill="#fff" fillOpacity={0.9} stroke="#c9a0dd" strokeWidth={1} />
+        <line x1={W - 160} y1={topY + 25} x2={W - 130} y2={topY + 25} stroke="#c9a0dd" strokeWidth={2} />
+        <text x={W - 125} y={topY + 29} fontSize="9" fill="#8060a0" fontWeight="600">Propped fractures</text>
+        <text x={W - 160} y={topY + 44} fontSize="8" fill="#8060a0">{nStages} clusters/well × {(fracHalf * 3.281).toFixed(0)} ft half-length</text>
+      </svg>
+    );
+  }
+
+  // EGS fracture heat exchange schematic — cross section showing fracture between wells
+  function EGSFractureCrossSection() {
+    const W = 560, H = 360;
+    const fracH = params.fracHeight || 170;
+    const fracHL = params.fracHalfLength || 200;
+    const wSpH = params.wellSpacingH || 150;
+    const wSpV = params.wellSpacingV || 60;
+
+    return (
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{maxWidth: W}}>
+        <defs>
+          <linearGradient id="thermGrad" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stopColor="#4a9edd" />
+            <stop offset="50%" stopColor="#c9a0dd" />
+            <stop offset="100%" stopColor="#F79130" />
+          </linearGradient>
+          <marker id="arrPurp" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#8060a0" /></marker>
+        </defs>
+
+        <text x={W/2} y={20} textAnchor="middle" fontSize="11" fontWeight="600" fill="#555">Fracture Heat Exchange — Cross Section</text>
+
+        {/* Rock background */}
+        <rect x={30} y={40} width={W-60} height={260} rx={4} fill="#e8ddd0" stroke="#c4b5a0" strokeWidth={1} />
+        <text x={W-50} y={58} fontSize="8" fill="#8b7060" textAnchor="end">Virgin rock T = {TrockDepth.toFixed(0)}°C</text>
+
+        {/* Thermal penetration zones flanking fracture */}
+        <rect x={140} y={70} width={280} height={200} rx={2} fill="#f0e0c8" fillOpacity={0.5} stroke="#d4b888" strokeWidth={1} strokeDasharray="4 2" />
+        <text x={280} y={85} textAnchor="middle" fontSize="8" fill="#a08050">Thermal depletion zone: δ(t) = √(4αt)</text>
+
+        {/* Fracture plane */}
+        <line x1={280} y1={80} x2={280} y2={260} stroke="#c9a0dd" strokeWidth={3} />
+        <text x={280} y={275} textAnchor="middle" fontSize="9" fontWeight="600" fill="#8060a0">Propped fracture plane</text>
+        <text x={280} y={287} textAnchor="middle" fontSize="8" fill="#8060a0">h = {fracH}m ({(fracH*3.281).toFixed(0)} ft)</text>
+
+        {/* Injector well (left) */}
+        <circle cx={120} cy={170} r={12} fill="#4a9edd" stroke="#2a6ea0" strokeWidth={2} />
+        <text x={120} y={174} textAnchor="middle" fontSize="8" fontWeight="700" fill="#fff">INJ</text>
+        <text x={120} y={145} textAnchor="middle" fontSize="8" fill="#2a6ea0">Cold fluid in</text>
+
+        {/* Producer well (right) */}
+        <circle cx={440} cy={170} r={12} fill="#F79130" stroke="#c06820" strokeWidth={2} />
+        <text x={440} y={174} textAnchor="middle" fontSize="8" fontWeight="700" fill="#fff">PROD</text>
+        <text x={440} y={145} textAnchor="middle" fontSize="8" fill="#c06820">Hot fluid out</text>
+
+        {/* Flow arrows through fracture */}
+        <line x1={135} y1={170} x2={265} y2={170} stroke="url(#thermGrad)" strokeWidth={2} markerEnd="url(#arrPurp)" />
+        <line x1={295} y1={170} x2={425} y2={170} stroke="url(#thermGrad)" strokeWidth={2} markerEnd="url(#arrPurp)" />
+
+        {/* Heat arrows from rock into fracture */}
+        {[110, 140, 170, 200, 230].map((y, i) => (
+          <g key={i}>
+            <line x1={200} y1={y} x2={270} y2={y} stroke="#C04151" strokeWidth={0.8} strokeDasharray="3 2" markerEnd="url(#arrR2)" />
+            <line x1={360} y1={y} x2={290} y2={y} stroke="#C04151" strokeWidth={0.8} strokeDasharray="3 2" />
+          </g>
+        ))}
+        <text x={195} y={248} fontSize="8" fill="#C04151" textAnchor="end">q = k/δ · (T_rock − T_fluid)</text>
+
+        {/* Spacing annotations */}
+        <line x1={120} y1={300} x2={440} y2={300} stroke="#888" strokeWidth={1} />
+        <line x1={120} y1={295} x2={120} y2={305} stroke="#888" strokeWidth={1} />
+        <line x1={440} y1={295} x2={440} y2={305} stroke="#888" strokeWidth={1} />
+        <text x={280} y={313} textAnchor="middle" fontSize="9" fill="#888">{wSpH}m ({(wSpH*3.281).toFixed(0)} ft) well spacing</text>
+
+        {/* Half-length annotation */}
+        <line x1={120} y1={100} x2={280} y2={100} stroke="#8060a0" strokeWidth={0.8} />
+        <text x={200} y={96} textAnchor="middle" fontSize="8" fill="#8060a0">half-length {fracHL}m ({(fracHL*3.281).toFixed(0)} ft)</text>
+      </svg>
+    );
+  }
+
+  // Closed-loop schematic
+  function LoopSchematic() {
+    const W = 500, H = 350;
+    const topY = 30, botY = 260, leftX = 100, rightX = 400, latY = botY;
+    return (
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{maxWidth: 520}}>
+        {/* Surface */}
+        <rect x={0} y={0} width={W} height={topY + 10} fill="#d4e8c2" /><line x1={0} y1={topY + 10} x2={W} y2={topY + 10} stroke="#6b8a50" strokeWidth={2} />
+        <text x={W / 2} y={20} textAnchor="middle" fontSize="10" fill="#4a6830" fontWeight="600">SURFACE ({Tsurf}°C)</text>
+
+        {/* Rock background */}
+        <rect x={0} y={topY + 10} width={W} height={botY - topY} fill="#e8ddd0" />
+
+        {/* Gradient shading */}
+        <defs><linearGradient id="rockGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#e8ddd0" /><stop offset="100%" stopColor="#c4a878" /></linearGradient></defs>
+        <rect x={0} y={topY + 10} width={W} height={botY - topY - 10} fill="url(#rockGrad)" />
+
+        {/* Depth label */}
+        <text x={50} y={botY - 5} fontSize="9" fill="#8b7060" textAnchor="middle">{dp}m depth</text>
+        <text x={50} y={botY + 8} fontSize="9" fill="#8b7060" textAnchor="middle">{TrockDepth.toFixed(0)}°C</text>
+
+        {/* Inlet vertical */}
+        <line x1={leftX} y1={topY + 10} x2={leftX} y2={botY} stroke="#4a9edd" strokeWidth={6} />
+        <text x={leftX - 20} y={(topY + botY) / 2} fontSize="9" fill="#2a6ea0" textAnchor="middle" transform={`rotate(-90, ${leftX - 20}, ${(topY + botY) / 2})`}>INLET VERTICAL (20 nodes)</text>
+        {/* Flow arrow */}
+        <polygon points={`${leftX - 4},${topY + 40} ${leftX + 4},${topY + 40} ${leftX},${topY + 55}`} fill="#2a6ea0" />
+
+        {/* Laterals */}
+        {Array.from({length: Math.min(nl, 6)}).map((_, i) => {
+          const yOff = i * 4 - (Math.min(nl, 6) - 1) * 2;
+          return <line key={i} x1={leftX} y1={latY + yOff} x2={rightX} y2={latY + yOff} stroke="#53BD2E" strokeWidth={3} />;
+        })}
+        <text x={(leftX + rightX) / 2} y={latY + 20} textAnchor="middle" fontSize="9" fill="#3a8a20" fontWeight="600">
+          {nl} LATERAL{nl > 1 ? 'S' : ''} × {ll}m (ANALYTICAL — no rock cells)
+        </text>
+        {/* Flow arrow */}
+        <polygon points={`${leftX + 80},${latY - 10} ${leftX + 95},${latY} ${leftX + 80},${latY + 10}`} fill="#3a8a20" />
+
+        {/* Outlet vertical */}
+        <line x1={rightX} y1={topY + 10} x2={rightX} y2={botY} stroke="#F79130" strokeWidth={6} />
+        <text x={rightX + 22} y={(topY + botY) / 2} fontSize="9" fill="#c06820" textAnchor="middle" transform={`rotate(90, ${rightX + 22}, ${(topY + botY) / 2})`}>OUTLET VERTICAL (30 nodes)</text>
+        {/* Flow arrow */}
+        <polygon points={`${rightX - 4},${topY + 65} ${rightX + 4},${topY + 65} ${rightX},${topY + 50}`} fill="#c06820" />
+
+        {/* Node indicators on outlet */}
+        {[0.1, 0.25, 0.5, 0.75, 0.9].map((f, i) => {
+          const y = botY - f * (botY - topY - 10);
+          return <g key={i}><circle cx={rightX} cy={y} r={3} fill="#F79130" stroke="#fff" strokeWidth={1} /></g>;
+        })}
+
+        {/* Labels */}
+        <text x={leftX} y={topY + 2} textAnchor="middle" fontSize="9" fill="#2a6ea0" fontWeight="600">IN ({params.inletTemp}°C)</text>
+        <text x={rightX} y={topY + 2} textAnchor="middle" fontSize="9" fill="#c06820" fontWeight="600">OUT</text>
+        <text x={rightX} y={topY - 8} textAnchor="middle" fontSize="8" fill="#888">(wellhead temp)</text>
+
+        {/* Warm zone halos on outlet nodes */}
+        {[0.1, 0.25, 0.5, 0.75, 0.9].map((f, i) => {
+          const y = botY - f * (botY - topY - 10);
+          return <circle key={'h'+i} cx={rightX} cy={y} r={10} fill="#F7913020" stroke="#F7913040" strokeWidth={0.5} />;
+        })}
+      </svg>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {isEGS ? (
+        <>
+        {/* EGS: Well Pattern */}
+        <div className="bg-white border border-gray-200">
+          <div className="bg-gray-100 px-3 py-1.5 border-b border-gray-200">
+            <h3 className="text-gray-700 font-semibold text-xs uppercase">EGS Well Pattern &amp; Flow Architecture</h3>
+          </div>
+          <div className="p-4 flex flex-col lg:flex-row gap-6 items-start">
+            <EGSWellPattern />
+            <div className="text-xs text-gray-600 leading-relaxed flex-1 space-y-3">
+              <p><strong>Alternating injector-producer pattern</strong> — similar to Fervo Energy's "wine-rack" configuration at Project Cape (Singh et al., 2025). Wells are drilled horizontally from a single pad and stacked in benches.</p>
+              <p><span style={{color:'#2a6ea0', fontWeight: 600}}>Injectors ({params.numInjectors || 3} per bench):</span> Cold fluid ({params.inletTemp}°C) is pumped down at {(params.flowRate * (params.numProducers || 2) / (params.numInjectors || 3)).toFixed(0)} kg/s per injector with WHP of {params.injWHP_psi || 2150} psi. Multistage plug-and-perf stimulation with proppant creates fracture connectivity to adjacent producers.</p>
+              <p><span style={{color:'#c06820', fontWeight: 600}}>Producers ({params.numProducers || 2} per bench):</span> Each producer receives {params.flowRate} kg/s of heated fluid through fracture network from injectors on both sides. Interior wells are bounded — flow recovery {">"} 99% (Singh et al., 2025).</p>
+              <p><span style={{color:'#8060a0', fontWeight: 600}}>Benches ({params.numBenches || 1}):</span> Vertically stacked well arrays separated by {params.benchSpacing || 215}m ({((params.benchSpacing || 215) * 3.281).toFixed(0)} ft). Bench spacing must exceed thermal penetration depth to avoid inter-bench thermal interference over project life.</p>
+              <p><strong>Simulation perspective:</strong> One producer well. Injection vertical uses Ramey (1962) model. Fracture exchange uses Gringarten et al. (1975) parallel-fracture analytical solution. Production vertical uses lumped-capacitance warmup model. Results scale linearly to field level.</p>
+            </div>
+          </div>
+        </div>
+
+        {/* EGS: Fracture cross-section */}
+        <div className="bg-white border border-gray-200">
+          <div className="bg-gray-100 px-3 py-1.5 border-b border-gray-200">
+            <h3 className="text-gray-700 font-semibold text-xs uppercase">Fracture Heat Exchange Model</h3>
+          </div>
+          <div className="p-4 flex flex-col lg:flex-row gap-6 items-start">
+            <EGSFractureCrossSection />
+            <div className="text-xs text-gray-600 leading-relaxed flex-1 space-y-3">
+              <p><strong>Gringarten et al. (1975)</strong> parallel-fracture solution for heat extraction from hot dry rock. Fluid flows through propped fractures and extracts heat by conduction from the surrounding rock matrix.</p>
+              <p>The thermal penetration depth into rock from each fracture face grows as:</p>
+              <div className="bg-gray-50 border border-gray-200 rounded p-2 font-mono text-center" style={{fontSize: 10}}>
+                δ(t) = √(4αt)
+              </div>
+              <p>The effective heat transfer coefficient between rock and fluid decreases with time as the near-fracture rock cools:</p>
+              <div className="bg-gray-50 border border-gray-200 rounded p-2 font-mono text-center" style={{fontSize: 10}}>
+                h(t) = k<sub>rock</sub> / (δ(t) / 2)
+              </div>
+              <p>Exit temperature per fracture uses an exponential (Ramey-type) solution:</p>
+              <div className="bg-gray-50 border border-gray-200 rounded p-2 font-mono text-center" style={{fontSize: 10}}>
+                T<sub>exit</sub> = T<sub>rock</sub> − (T<sub>rock</sub> − T<sub>in</sub>) · exp(−A<sub>frac</sub> / (ṁ · c<sub>p</sub> · R<sub>frac</sub>))
+              </div>
+              <p>where A<sub>frac</sub> = 2 · half-length · height × 2 faces, R<sub>frac</sub> = 1/h(t), and ṁ is the flow per fracture. The fracture area and flow per fracture are computed from lateral length / cluster spacing.</p>
+              <p><strong>Thermal depletion</strong> is tracked as cumulative energy extracted per unit fracture area. The effective rock temperature decreases as energy is mined from the penetration zone, with inter-bench interference capped at half the bench spacing.</p>
+            </div>
+          </div>
+        </div>
+        </>
+      ) : (
+        <>
+        {/* Closed-loop: Loop overview */}
+        <div className="bg-white border border-gray-200">
+          <div className="bg-gray-100 px-3 py-1.5 border-b border-gray-200">
+            <h3 className="text-gray-700 font-semibold text-xs uppercase">Loop Architecture</h3>
+          </div>
+          <div className="p-4 flex flex-col lg:flex-row gap-6 items-start">
+            <LoopSchematic />
+            <div className="text-xs text-gray-600 leading-relaxed flex-1 space-y-3">
+              <p><strong>The model has three sections,</strong> each handled differently:</p>
+              <p><span style={{color:'#2a6ea0', fontWeight: 600}}>Inlet Vertical (20 axial nodes):</span> Cool fluid descends, gaining heat from surrounding rock through cased wellbore. Each node uses Ramey's wellbore heat transmission model (Ramey, 1962) with a time-dependent thermal resistance f(t). Heat gain is modest due to high casing resistance (~0.40 m·K/W per unit length).</p>
+              <p><span style={{color:'#3a8a20', fontWeight: 600}}>Laterals (analytical — no cells):</span> The Toews &amp; Holmes (2021) analytical solution gives exit temperature directly. This extends Ramey's (1962) approach to horizontal wellbores in a geothermal gradient, using the line-source solution for radial heat conduction. For each lateral at timestep <em>n</em>:</p>
+              <div className="bg-gray-50 border border-gray-200 rounded p-2 font-mono text-center" style={{fontSize: 10}}>
+                T<sub>exit</sub> = T<sub>rock</sub> − (T<sub>rock</sub> − T<sub>in</sub>) · exp(−L / A)
+              </div>
+              <p className="pl-3">where A = ṁ·c<sub>p</sub>·R<sub>total</sub>(t) is the relaxation length, R<sub>total</sub> includes the wellbore resistance and time-dependent rock resistance R<sub>rock</sub> = ln(r<sub>eff</sub>/r<sub>w</sub>) / (2πk<sub>rock</sub>), and r<sub>eff</sub>(t) = (π/2)·√(αt) is the effective thermal penetration radius (Carslaw &amp; Jaeger, 1959).</p>
+              <p><span style={{color:'#c06820', fontWeight: 600}}>Outlet Vertical (30 axial nodes):</span> Hot fluid ascends through cold cased well. Each node has a lumped thermal mass representing casing, cement, and near-wellbore rock. This captures the characteristic warmup transient observed in Eavor-Lite field data (Toews &amp; Vany, 2023) where outlet temperature takes days to weeks to stabilize.</p>
+            </div>
+          </div>
+        </div>
+        </>
+      )}
+
+      {/* Cross-section — shared between EGS and closed-loop (production vertical is same model) */}
+      <div className="bg-white border border-gray-200">
+        <div className="bg-gray-100 px-3 py-1.5 border-b border-gray-200">
+          <h3 className="text-gray-700 font-semibold text-xs uppercase">{isEGS ? 'Production' : 'Outlet'} Vertical — Wellbore Cross-Section (per node)</h3>
+        </div>
+        <div className="p-4 flex flex-col lg:flex-row gap-6 items-start">
+          <CrossSection />
+          <div className="text-xs text-gray-600 leading-relaxed flex-1 space-y-3">
+            <p><strong>Lumped capacitance model</strong> — analogous to Hasan &amp; Kabir's (2002) wellbore heat transfer formulation, simplified for the outlet vertical where the dominant physics is radial heat loss from hot ascending fluid.</p>
+            <p>Each outlet node solves an ODE for the wall temperature T<sub>w</sub> of the lumped zone:</p>
+            <div className="bg-gray-50 border border-gray-200 rounded p-2 font-mono" style={{fontSize: 10}}>
+              <div>C<sub>wall</sub> · dT<sub>w</sub>/dt = (T<sub>f</sub> − T<sub>w</sub>)/R<sub>c</sub> − (T<sub>w</sub> − T<sub>∞</sub>)/R<sub>o</sub></div>
+            </div>
+            <p>where the thermal capacitance is:</p>
+            <div className="bg-gray-50 border border-gray-200 rounded p-2 font-mono" style={{fontSize: 10}}>
+              C<sub>wall</sub> = ρ<sub>rock</sub> · c<sub>p,rock</sub> · π(r<sub>warm</sub>² − r<sub>w</sub>²) · Δz
+            </div>
+            <p>This has an exact exponential solution per timestep (unconditionally stable):</p>
+            <div className="bg-gray-50 border border-gray-200 rounded p-2 font-mono" style={{fontSize: 10}}>
+              <div>T<sub>ss</sub> = (T<sub>f</sub>/R<sub>c</sub> + T<sub>∞</sub>/R<sub>o</sub>) / (1/R<sub>c</sub> + 1/R<sub>o</sub>)</div>
+              <div className="mt-1">τ = C<sub>wall</sub> / (1/R<sub>c</sub> + 1/R<sub>o</sub>)</div>
+              <div className="mt-1">T<sub>w</sub>(t+Δt) = T<sub>ss</sub> + (T<sub>w</sub>(t) − T<sub>ss</sub>) · exp(−Δt/τ)</div>
+            </div>
+            <p><span style={{color:'#4a9edd', fontWeight: 600}}>Fluid (blue):</span> Temperature from upstream nodes. Fluid exit temperature per node: T<sub>f,out</sub> = T<sub>w</sub> + (T<sub>f,in</sub> − T<sub>w</sub>) · exp(−Δz / (ṁ·c<sub>p</sub>·R<sub>c</sub>)), following Ramey (1962).</p>
+            <p><span style={{color:'#c07020', fontWeight: 600}}>Warm zone (gold):</span> Lumped thermal mass (r = {r_warmup}m). At steady state, T<sub>w</sub> → T<sub>ss</sub> which depends on the ratio R<sub>o</sub>/R<sub>c</sub>. Always drives heat outward to far-field.</p>
+            <p><span style={{color:'#6b5b4f', fontWeight: 600}}>Virgin rock (beige):</span> Far-field at the undisturbed geothermal gradient. R<sub>outward</sub>(t) = ln(r<sub>eff</sub>(t)/r<sub>warm</sub>) / (2πk) grows with time as thermal front penetrates further into rock.</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Production vertical temperature profile — step-by-step calculation */}
+      <div className="bg-white border border-gray-200">
+        <div className="bg-gray-100 px-3 py-1.5 border-b border-gray-200">
+          <h3 className="text-gray-700 font-semibold text-xs uppercase">{isEGS ? 'Production' : 'Outlet'} Vertical — Temperature Loss to Surface</h3>
+        </div>
+        <div className="p-4 flex flex-col lg:flex-row gap-6 items-start">
+          {(() => {
+            const W = 580, H = 560;
+            const nNodes = isEGS ? 15 : 30;
+            const flowRate = isEGS ? params.flowRate : (params.flowRate || 5.76);
+            const topY = 45, botY = 420, wellX = 140;
+            const profX = 260;
+            const Tmin = Math.min(Tsurf, params.inletTemp) - 5;
+            const Tmax = TrockDepth + 15;
+            const tScale = 200 / (Tmax - Tmin);
+
+            const rEff1yr = (Math.PI / 2) * Math.sqrt(alpha * 365 * 86400);
+            const Ro1yr = Math.max(Math.log(rEff1yr / r_warmup) / (2 * Math.PI * params.rockThermalCond), 0.01);
+            const Rcas = 0.20;
+            const Ui = 1/Rcas, Uo = 1/Ro1yr;
+
+            const nShow = 6;
+            const nodeDepths = Array.from({length: nShow}, (_, i) => dp * (1 - i / (nShow - 1)));
+            let Tf = TrockDepth;
+            const profile = nodeDepths.map(d => {
+              const Tvirgin = Tsurf + (grad / 1000) * d;
+              const Tss = (Tf * Ui + Tvirgin * Uo) / (Ui + Uo);
+              const Twall = Tss;
+              const dz = dp / nNodes;
+              const nodesInSeg = Math.round(dp / (nShow - 1) / dz);
+              let tf = Tf;
+              for (let n = 0; n < nodesInSeg; n++) {
+                const depthHere = d - n * dz;
+                if (depthHere < 0) break;
+                const tv = Tsurf + (grad / 1000) * depthHere;
+                const tss = (tf * Ui + tv * Uo) / (Ui + Uo);
+                tf -= (tf - tss) / Rcas * dz / (flowRate * params.fluidHeatCapacity);
+              }
+              const result = { depth: d, Tvirgin, Twall: Math.round(Twall * 10) / 10, TfIn: Math.round(Tf * 10) / 10, TfOut: Math.round(tf * 10) / 10 };
+              Tf = tf;
+              return result;
+            });
+            const surfaceT = Math.round(Tf * 10) / 10;
+            const totalLoss = Math.round((TrockDepth - Tf) * 10) / 10;
+
+            return (
+              <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{maxWidth: W}}>
+                <defs>
+                  <linearGradient id="depthGrad2" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#d4e8c2" />
+                    <stop offset="8%" stopColor="#e8ddd0" />
+                    <stop offset="100%" stopColor="#c4a878" />
+                  </linearGradient>
+                </defs>
+
+                <text x={W/2} y={16} textAnchor="middle" fontSize="11" fontWeight="600" fill="#555">
+                  Temperature Loss: Reservoir → Wellhead (~1 yr steady state)
+                </text>
+                <text x={W/2} y={30} textAnchor="middle" fontSize="9" fill="#888">
+                  ṁ = {flowRate} kg/s | R_c = {Rcas} m·K/W | R_o(1yr) = {Ro1yr.toFixed(3)} m·K/W | {nNodes} nodes
+                </text>
+
+                <rect x={70} y={topY} width={W - 90} height={botY - topY} rx={3} fill="url(#depthGrad2)" />
+                <line x1={70} y1={topY} x2={W - 20} y2={topY} stroke="#6b8a50" strokeWidth={2} />
+
+                <line x1={wellX} y1={topY} x2={wellX} y2={botY} stroke="#F79130" strokeWidth={8} strokeLinecap="round" />
+                <line x1={wellX} y1={topY} x2={wellX} y2={botY} stroke="#fff" strokeWidth={3} />
+                <polygon points={`${wellX-5},${botY-50} ${wellX+5},${botY-50} ${wellX},${botY-63}`} fill="#c06820" />
+                <text x={wellX - 18} y={(topY + botY) / 2} fontSize="9" fill="#c06820" textAnchor="middle" transform={`rotate(-90, ${wellX - 18}, ${(topY + botY) / 2})`} fontWeight="600">ASCENDING FLUID</text>
+
+                {/* Virgin rock gradient line */}
+                <line x1={profX + (Tsurf - Tmin) * tScale} y1={topY} x2={profX + (TrockDepth - Tmin) * tScale} y2={botY} stroke="#8b7b6f" strokeWidth={1.5} strokeDasharray="4 3" />
+
+                {/* Fluid temperature profile */}
+                {(() => {
+                  const pts = profile.map(p => {
+                    const y = topY + (1 - p.depth / dp) * (botY - topY);
+                    const x = profX + (p.TfIn - Tmin) * tScale;
+                    return `${x},${y}`;
+                  }).join(' ');
+                  return <polyline points={pts} fill="none" stroke="#F79130" strokeWidth={2.5} />;
+                })()}
+
+                {/* Wall temperature profile */}
+                {(() => {
+                  const pts = profile.map(p => {
+                    const y = topY + (1 - p.depth / dp) * (botY - topY);
+                    const x = profX + (p.Twall - Tmin) * tScale;
+                    return `${x},${y}`;
+                  }).join(' ');
+                  return <polyline points={pts} fill="none" stroke="#e6a040" strokeWidth={1.8} />;
+                })()}
+
+                {/* Node markers */}
+                {profile.map((p, i) => {
+                  const y = topY + (1 - p.depth / dp) * (botY - topY);
+                  const xF = profX + (p.TfIn - Tmin) * tScale;
+                  return (
+                    <g key={i}>
+                      <circle cx={wellX} cy={y} r={4} fill="#F79130" stroke="#fff" strokeWidth={1} />
+                      <circle cx={wellX} cy={y} r={11} fill="none" stroke="#F7913040" strokeWidth={0.5} />
+                      <line x1={wellX + 13} y1={y} x2={wellX + 32} y2={y} stroke="#C0415180" strokeWidth={0.8} />
+                      <circle cx={xF} cy={y} r={3} fill="#F79130" />
+                      <text x={xF + 7} y={y - 4} fontSize="8" fill="#c06820" fontWeight="600">{p.TfIn}°</text>
+                      <text x={68} y={y + 3} textAnchor="end" fontSize="8" fill="#888">{Math.round(p.depth)}m</text>
+                    </g>
+                  );
+                })}
+
+                {/* Summary box */}
+                <rect x={profX - 5} y={topY - 2} width={190} height={32} rx={3} fill="#fff" fillOpacity={0.92} stroke="#F79130" strokeWidth={1} />
+                <text x={profX + 90} y={topY + 10} textAnchor="middle" fontSize="9" fontWeight="700" fill="#c06820">Wellhead: {surfaceT}°C</text>
+                <text x={profX + 90} y={topY + 23} textAnchor="middle" fontSize="8" fill="#888">Loss: {totalLoss}°C from {TrockDepth.toFixed(0)}°C reservoir</text>
+
+                {/* Legend */}
+                <g transform={`translate(${profX - 5}, ${botY + 18})`}>
+                  <line x1={0} y1={0} x2={22} y2={0} stroke="#F79130" strokeWidth={2.5} />
+                  <text x={27} y={4} fontSize="8" fill="#c06820">T_fluid</text>
+                  <line x1={75} y1={0} x2={97} y2={0} stroke="#e6a040" strokeWidth={2} />
+                  <text x={102} y={4} fontSize="8" fill="#c07020">T_wall (ss)</text>
+                  <line x1={160} y1={0} x2={182} y2={0} stroke="#8b7b6f" strokeWidth={1.5} strokeDasharray="4 3" />
+                  <text x={187} y={4} fontSize="8" fill="#8b7b6f">T_virgin</text>
+                </g>
+
+                {/* Step-by-step */}
+                <g transform={`translate(${profX - 5}, ${botY + 38})`}>
+                  <text x={0} y={0} fontSize="9" fill="#555" fontWeight="600">Per-node calculation (bottom → top):</text>
+                  <text x={0} y={15} fontSize="8" fill="#555">1. T_ss = (T_f /R_c + T_∞ /R_o) / (1/R_c + 1/R_o) — steady-state wall target</text>
+                  <text x={0} y={29} fontSize="8" fill="#555">2. T_wall(t+Δt) = T_ss + (T_w − T_ss) · exp(−Δt/τ) — exponential warmup</text>
+                  <text x={0} y={43} fontSize="8" fill="#555">3. ΔT_f = (T_f − T_wall)/R_c · Δz/(ṁ·c_p) — fluid cools each node</text>
+                  <text x={0} y={57} fontSize="8" fill="#555">4. Pass T_f to next node upward → repeat</text>
+                </g>
+              </svg>
+            );
+          })()}
+          <div className="text-xs text-gray-600 leading-relaxed flex-1 space-y-3">
+            <p><strong>Hot fluid rises from reservoir to surface</strong> through {isEGS ? 15 : 30} nodes, losing heat to colder surrounding rock at each depth.</p>
+            <p><span style={{color:'#c06820', fontWeight: 600}}>T_fluid (orange):</span> Enters at the bottom near reservoir temperature ({TrockDepth.toFixed(0)}°C). The relaxation length L = ṁ·c_p·R_c = {(params.flowRate * params.fluidHeatCapacity * 0.20 / 1000).toFixed(0)} km is {params.flowRate > 20 ? 'much ' : ''}longer than the well ({(dp/1000).toFixed(1)} km), so the fluid {params.flowRate > 20 ? 'barely equilibrates — only a few °C lost' : 'loses significant heat'}.</p>
+            <p><span style={{color:'#c07020', fontWeight: 600}}>T_wall (gold):</span> Steady-state wall temperature at each depth. Near bottom it tracks T_fluid. Near surface it's pulled toward the cold T_virgin, creating the largest heat loss in the shallowest nodes.</p>
+            <p><span style={{color:'#8b7b6f', fontWeight: 600}}>T_virgin (dashed):</span> Geothermal gradient from {Tsurf.toFixed(0)}°C (surface) to {TrockDepth.toFixed(0)}°C (depth). The gap between T_fluid and T_virgin drives the heat loss — widest near surface.</p>
+            <p><strong>Time dependence:</strong> R_outward(t) = ln(r_eff(t)/r_warm)/(2πk) grows logarithmically. Early on (days), the warm zone is thin → heat escapes easily → large losses. Over months, the thermal front pushes outward → R_o grows → losses decrease. This is the warmup transient.</p>
+            <p><strong>Sensitivity:</strong> At {params.flowRate} kg/s, the total loss is ~{isEGS ? '2-3' : '4-8'}°C. Halving the flow rate roughly doubles the loss. Deeper wells lose more (more cold rock to pass through). Insulated completions (higher R_c) would reduce loss but are rarely cost-effective.</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Literature & equations reference */}
+      <div className="bg-white border border-gray-200">
+        <div className="bg-gray-100 px-3 py-1.5 border-b border-gray-200">
+          <h3 className="text-gray-700 font-semibold text-xs uppercase">Key Equations &amp; Literature</h3>
+        </div>
+        <div className="p-4">
+          <table className="w-full text-xs border-collapse">
+            <thead>
+              <tr className="border-b border-gray-300">
+                <th className="text-left py-1.5 pr-3 text-gray-500 font-semibold w-1/4">Component</th>
+                <th className="text-left py-1.5 pr-3 text-gray-500 font-semibold w-1/3">Equation</th>
+                <th className="text-left py-1.5 text-gray-500 font-semibold">Source</th>
+              </tr>
+            </thead>
+            <tbody className="text-gray-600">
+              <tr className="border-b border-gray-100">
+                <td className="py-2 pr-3 font-medium">{isEGS ? 'Fracture heat extraction' : 'Lateral heat extraction'}</td>
+                <td className="py-2 pr-3 font-mono" style={{fontSize: 10}}>{isEGS ? <>T<sub>exit</sub> = T<sub>rock</sub> − (T<sub>rock</sub> − T<sub>in</sub>)·e<sup>−A/(ṁ·c<sub>p</sub>·R<sub>frac</sub>)</sup></> : <>T<sub>exit</sub> = T<sub>rock</sub> − (T<sub>rock</sub> − T<sub>in</sub>)·e<sup>−L/A</sup></>}</td>
+                <td className="py-2">{isEGS ? 'Gringarten et al. (1975), parallel-fracture model. Adapted from "Theory of Heat Extraction from Fractured Hot Dry Rock," J. Geophys. Res.' : 'Toews & Holmes (2021), extending Ramey (1962). Validated against Eavor-Lite field data with MAE = 0.19°C.'}</td>
+              </tr>
+              {isEGS && (
+              <tr className="border-b border-gray-100">
+                <td className="py-2 pr-3 font-medium">Thermal penetration (frac)</td>
+                <td className="py-2 pr-3 font-mono" style={{fontSize: 10}}>δ(t) = √(4αt), h = k/δ</td>
+                <td className="py-2">1D conduction from fracture face into rock matrix. h decreases with √t as thermal front penetrates deeper. Capped at half bench spacing for multi-bench interference.</td>
+              </tr>
+              )}
+              {isEGS && (
+              <tr className="border-b border-gray-100">
+                <td className="py-2 pr-3 font-medium">Pump parasitic</td>
+                <td className="py-2 pr-3 font-mono" style={{fontSize: 10}}>P<sub>pump</sub> = ΔP · Q<sub>inj</sub> / η<sub>pump</sub></td>
+                <td className="py-2">ΔP = injection WHP − production WHP. Total injection rate allocated per producer. η<sub>pump</sub> = 75%. Per GeoExpro (2025) analysis of Cape Station parasitic loads.</td>
+              </tr>
+              )}
+              <tr className="border-b border-gray-100">
+                <td className="py-2 pr-3 font-medium">Thermal penetration</td>
+                <td className="py-2 pr-3 font-mono" style={{fontSize: 10}}>r<sub>eff</sub>(t) = (π/2)·√(αt)</td>
+                <td className="py-2">Carslaw &amp; Jaeger (1959), <em>Conduction of Heat in Solids</em>. Line-source approximation for radial diffusion.</td>
+              </tr>
+              <tr className="border-b border-gray-100">
+                <td className="py-2 pr-3 font-medium">Rock thermal resistance</td>
+                <td className="py-2 pr-3 font-mono" style={{fontSize: 10}}>R<sub>rock</sub> = ln(r<sub>eff</sub>/r<sub>w</sub>) / (2πk)</td>
+                <td className="py-2">Hollow-cylinder steady-state conduction (Incropera &amp; DeWitt, 2002). Time-dependence enters via r<sub>eff</sub>(t).</td>
+              </tr>
+              <tr className="border-b border-gray-100">
+                <td className="py-2 pr-3 font-medium">Wellbore heat transmission</td>
+                <td className="py-2 pr-3 font-mono" style={{fontSize: 10}}>dT<sub>f</sub>/dz = (T<sub>rock</sub> − T<sub>f</sub>) / (ṁ·c<sub>p</sub>·R<sub>tot</sub>)</td>
+                <td className="py-2">Ramey (1962), "Wellbore Heat Transmission," <em>JPT</em>. Foundational model for wellbore heat exchange.</td>
+              </tr>
+              <tr className="border-b border-gray-100">
+                <td className="py-2 pr-3 font-medium">Outlet lumped wall</td>
+                <td className="py-2 pr-3 font-mono" style={{fontSize: 10}}>C·dT<sub>w</sub>/dt = (T<sub>f</sub>−T<sub>w</sub>)/R<sub>c</sub> − (T<sub>w</sub>−T<sub>∞</sub>)/R<sub>o</sub></td>
+                <td className="py-2">Lumped capacitance (Lienhard &amp; Lienhard, 2019). Exact exponential solution — unconditionally stable.</td>
+              </tr>
+              <tr className="border-b border-gray-100">
+                <td className="py-2 pr-3 font-medium">ORC net efficiency</td>
+                <td className="py-2 pr-3 font-mono" style={{fontSize: 10}}>η<sub>net</sub> = 0.45·η<sub>Carnot</sub> = 0.45·(1 − T<sub>rej</sub>/T<sub>hot</sub>)</td>
+                <td className="py-2">DiPippo (2012), <em>Geothermal Power Plants</em>. 45% of Carnot is representative for subcritical ORC with air-cooled condenser.</td>
+              </tr>
+              <tr className="border-b border-gray-100">
+                <td className="py-2 pr-3 font-medium">Hydraulics (friction)</td>
+                <td className="py-2 pr-3 font-mono" style={{fontSize: 10}}>dP/dL = f·ρv²/(2D), f = 0.316·Re<sup>−0.25</sup></td>
+                <td className="py-2">Darcy-Weisbach with Blasius correlation for turbulent flow in smooth pipes (Moody, 1944).</td>
+              </tr>
+              <tr>
+                <td className="py-2 pr-3 font-medium">Seasonal ambient</td>
+                <td className="py-2 pr-3 font-mono" style={{fontSize: 10}}>T<sub>amb</sub>(d) = T̄ + A·cos(2π(d−200)/365)</td>
+                <td className="py-2">Sinusoidal approximation to annual air temperature cycle. Peak at day 200 (mid-July NH). Amplitudes from climate normals.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* What we DON'T model */}
+      <div className="bg-white border border-gray-200">
+        <div className="bg-gray-100 px-3 py-1.5 border-b border-gray-200">
+          <h3 className="text-gray-700 font-semibold text-xs uppercase">What a Full Radial FD Model Would Look Like</h3>
+        </div>
+        <div className="p-4 flex flex-col lg:flex-row gap-6 items-start">
+          <svg viewBox="0 0 400 300" className="w-full" style={{maxWidth: 400}}>
+            <text x={200} y={18} textAnchor="middle" fontSize="10" fontWeight="600" fill="#555">Radial Finite-Difference Grid (NOT used)</text>
+            {[15, 30, 50, 75, 105, 140].map((r, i) => (
+              <circle key={i} cx={200} cy={165} r={r} fill="none" stroke={i === 0 ? '#4a9edd' : '#c4b5a0'} strokeWidth={i === 0 ? 2 : 1} strokeDasharray={i > 0 ? '3 2' : ''} />
+            ))}
+            {[{r: 22, label: 'Shell 1'}, {r: 40, label: 'Shell 2'}, {r: 62, label: 'Shell 3'}, {r: 90, label: '...'}, {r: 122, label: 'Shell N'}].map((s, i) => (
+              <text key={i} x={200 + s.r} y={165} fontSize="7" fill="#8b7b6f" textAnchor="middle" transform={`rotate(30, ${200 + s.r}, 165)`}>{s.label}</text>
+            ))}
+            <circle cx={200} cy={165} r={12} fill="#4a9edd" /><text x={200} y={168} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="600">Fluid</text>
+            {[22, 40, 62, 90].map((r, i) => (
+              <line key={i} x1={200} y1={165 - r} x2={200} y2={165 - r - 12} stroke="#C04151" strokeWidth={1} markerEnd="url(#arrowRedFD)" />
+            ))}
+            <text x={200} y={250} textAnchor="middle" fontSize="9" fill="#888">Each shell exchanges heat with neighbors every Δt</text>
+            <text x={200} y={264} textAnchor="middle" fontSize="9" fill="#C04151" fontWeight="600">Stability requires Δt {"<"} Δr² / (2α) ≈ 2 minutes</text>
+            <text x={200} y={278} textAnchor="middle" fontSize="9" fill="#888">Our timesteps are 4–168 hours → would be unstable</text>
+            <defs><marker id="arrowRedFD" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#C04151" /></marker></defs>
+          </svg>
+          <div className="text-xs text-gray-600 leading-relaxed flex-1 space-y-3">
+            <p><strong>A radial FD approach</strong> would discretize the rock into concentric logarithmically-spaced shells around each axial node, solving the diffusion equation ∂T/∂t = α·(1/r)·∂/∂r(r·∂T/∂r) explicitly at each timestep (e.g., Beckers et al., 2015, Slender-Body Theory simulator).</p>
+            <p><strong>The stability constraint</strong> for explicit radial diffusion is Δt {"<"} Δr²/(2α). With the innermost shell at Δr ≈ 2.4cm and typical rock diffusivity α ≈ 1.6×10⁻⁶ m²/s, the maximum stable timestep is ~2 minutes. Our adaptive timesteps range from 4 hours to 7 days — unstable by 100×.</p>
+            <p><strong>Alternatives:</strong> (1) Implicit Crank-Nicolson solver (tridiagonal matrix per node per timestep — what NREL's SBT simulator uses), (2) much finer timesteps (10,000× more computation), or (3) the lumped approach we use, which captures the right physics without the stability constraint.</p>
+            <p>Our lumped model sacrifices the radial temperature profile but correctly predicts outlet temperature evolution, warmup transient timescale, and steady-state heat loss — the quantities that drive system economics. The Toews &amp; Holmes lateral model has been validated against 16+ months of Eavor-Lite operational data with MAE of 0.19°C (0.37%).</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =============================================================
+// 3D WELLBORE VIEWER
+// =============================================================
+
+function WellboreViewer3D({ params }) {
+  const mountRef = useRef(null);
+  const sceneRef = useRef(null);
+  const frameRef = useRef(null);
+  const mouseRef = useRef({ down: false, button: 0, x: 0, y: 0, theta: Math.PI / 4, phi: Math.PI / 3, dist: 5, tx: 0, ty: 0 });
+
+  useEffect(() => {
+    const container = mountRef.current;
+    if (!container) return;
+    const W = container.clientWidth, H = container.clientHeight || 600;
+
+    // Scene setup
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xf3f4f6);
+    const camera = new THREE.PerspectiveCamera(50, W / H, 0.01, 100);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(W, H);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    container.innerHTML = '';
+    container.appendChild(renderer.domElement);
+
+    // Scale: 1 unit = 1km
+    const dp = params.depthVertical / 1000;
+    const ll = params.lateralLength / 1000;
+    const nl = params.numLaterals;
+    const nPairs = Math.ceil(nl / 2);
+    const stackSep = 0.05; // vertical separation between upper and lower lateral levels (colocated)
+    const fanAngle = Math.min(nPairs * 5, 60) * Math.PI / 180;
+
+    // Materials
+    const matInlet = new THREE.MeshPhongMaterial({ color: 0x4a9edd });
+    const matOutlet = new THREE.MeshPhongMaterial({ color: 0xF79130 });
+    const matLateral = new THREE.MeshPhongMaterial({ color: 0x53BD2E });
+    const matJunction = new THREE.MeshPhongMaterial({ color: 0x53BD2E, emissive: 0x2a6010 });
+    const matSurface = new THREE.MeshPhongMaterial({ color: 0x8bc34a, transparent: true, opacity: 0.3, side: THREE.DoubleSide });
+    const matRock = new THREE.MeshPhongMaterial({ color: 0xc4b5a0, transparent: true, opacity: 0.06, side: THREE.DoubleSide });
+    const matWire = new THREE.LineBasicMaterial({ color: 0xc4b5a0, transparent: true, opacity: 0.12 });
+
+    // Casing program (visual radii, exaggerated for visibility):
+    // 22" surface → 13-3/8" intermediate → 9-5/8" production → 7" liner → 6" open-hole lateral
+    const casingRadii = [0.04, 0.032, 0.024, 0.018]; // visual radii for each section
+    const latR = 0.012; // lateral radius (thinner, open-hole)
+
+    // Helper: create a tube between two 3D points
+    function addTube(p1, p2, radius, mat) {
+      const dir = new THREE.Vector3().subVectors(p2, p1);
+      const len = dir.length();
+      if (len < 0.001) return;
+      const geo = new THREE.CylinderGeometry(radius, radius, len, 8);
+      const mesh = new THREE.Mesh(geo, mat);
+      const mid = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
+      mesh.position.copy(mid);
+      const up = new THREE.Vector3(0, 1, 0);
+      const q = new THREE.Quaternion().setFromUnitVectors(up, dir.normalize());
+      mesh.quaternion.copy(q);
+      scene.add(mesh);
+      return mesh;
+    }
+
+    const isUtube = (params.architecture || 'colocated') === 'utube';
+
+    if (isUtube) {
+      // ===== U-TUBE ARCHITECTURE (Eavor-Lite) =====
+      // Inlet and outlet wells at separate surface locations, laterals run horizontally between them
+      const inletX = -ll / 2;
+      const outletX = ll / 2;
+      const spacing = Math.min(ll * 0.04, 0.12);
+      const totalSpread = (nl - 1) * spacing;
+
+      // Telescoping verticals at separate pads
+      function addTelescopingAt(x, z, depth, mat) {
+        const sections = [
+          { frac: 0.10, r: casingRadii[0] },
+          { frac: 0.25, r: casingRadii[1] },
+          { frac: 0.35, r: casingRadii[2] },
+          { frac: 0.30, r: casingRadii[3] },
+        ];
+        let yTop = 0;
+        for (const s of sections) {
+          const segLen = depth * s.frac;
+          addTube(new THREE.Vector3(x, yTop, z), new THREE.Vector3(x, yTop - segLen, z), s.r, mat);
+          yTop -= segLen;
+        }
+      }
+
+      addTelescopingAt(inletX, 0, dp, matInlet);
+      addTelescopingAt(outletX, 0, dp, matOutlet);
+
+      // Wellhead markers
+      const whGeo = new THREE.CylinderGeometry(casingRadii[0] * 1.5, casingRadii[0] * 1.5, 0.04, 12);
+      const whIn = new THREE.Mesh(whGeo, matInlet);
+      whIn.position.set(inletX, 0.02, 0);
+      scene.add(whIn);
+      const whOut = new THREE.Mesh(whGeo, matOutlet);
+      whOut.position.set(outletX, 0.02, 0);
+      scene.add(whOut);
+
+      // Laterals connecting the two verticals at depth, spread in Z
+      for (let i = 0; i < nl; i++) {
+        const z = nl === 1 ? 0 : -totalSpread / 2 + i * spacing;
+        addTube(new THREE.Vector3(inletX, -dp, z), new THREE.Vector3(outletX, -dp, z), latR, matLateral);
+        // Junction spheres at each end
+        const jGeo = new THREE.SphereGeometry(latR * 1.8, 8, 8);
+        const jL = new THREE.Mesh(jGeo, matJunction);
+        jL.position.set(inletX, -dp, z);
+        scene.add(jL);
+        const jR = new THREE.Mesh(jGeo, matJunction);
+        jR.position.set(outletX, -dp, z);
+        scene.add(jR);
+      }
+
+      // Pad markers at each surface location
+      const padGeo = new THREE.CylinderGeometry(0.06, 0.06, 0.01, 16);
+      const padMatGrey = new THREE.MeshPhongMaterial({ color: 0x888888 });
+      const pad1 = new THREE.Mesh(padGeo, padMatGrey);
+      pad1.position.set(inletX, 0.005, 0);
+      scene.add(pad1);
+      const pad2 = new THREE.Mesh(padGeo, padMatGrey);
+      pad2.position.set(outletX, 0.005, 0);
+      scene.add(pad2);
+
+      // Depth markers on inlet
+      for (let d = 1; d <= Math.floor(dp); d++) {
+        const tGeo = new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(inletX - 0.08, -d, 0), new THREE.Vector3(inletX + 0.08, -d, 0),
+        ]);
+        scene.add(new THREE.Line(tGeo, new THREE.LineBasicMaterial({ color: 0x999999 })));
+      }
+
+      // Surface plane & rock volume
+      const surfSize = Math.max(ll * 1.8, dp * 2);
+      const surfGeo = new THREE.PlaneGeometry(surfSize, surfSize);
+      const surfMesh = new THREE.Mesh(surfGeo, matSurface);
+      surfMesh.rotation.x = -Math.PI / 2;
+      scene.add(surfMesh);
+
+      const rockGeo = new THREE.BoxGeometry(ll * 1.3, dp * 1.1, totalSpread + ll * 0.3);
+      const rockMesh = new THREE.Mesh(rockGeo, matRock);
+      rockMesh.position.set(0, -dp / 2, 0);
+      scene.add(rockMesh);
+      const rockEdges = new THREE.EdgesGeometry(rockGeo);
+      const rockLine = new THREE.LineSegments(rockEdges, matWire);
+      rockLine.position.copy(rockMesh.position);
+      scene.add(rockLine);
+
+    } else {
+      // ===== CO-LOCATED ARCHITECTURE (Geretsried / James Joyce) =====
+      // Both verticals from same pad, laterals fan out, connect toe-to-toe stacked
+      const vertSepLocal = 0.03;
+      const inletDepth = dp + stackSep / 2;
+      const outletDepth = dp - stackSep / 2;
+
+      // Telescoping verticals at shared pad
+      function addTelescopingVertical(xOff, totalDepth, mat) {
+        const sections = [
+          { frac: 0.08, r: casingRadii[0] },
+          { frac: 0.22, r: casingRadii[1] },
+          { frac: 0.40, r: casingRadii[2] },
+          { frac: 0.30, r: casingRadii[3] },
+        ];
+        let yTop = 0;
+        for (const s of sections) {
+          const segLen = totalDepth * s.frac;
+          addTube(new THREE.Vector3(xOff, yTop, 0), new THREE.Vector3(xOff, yTop - segLen, 0), s.r, mat);
+          yTop -= segLen;
+        }
+      }
+
+      addTelescopingVertical(-vertSepLocal, inletDepth, matInlet);
+      addTelescopingVertical(vertSepLocal, outletDepth, matOutlet);
+
+      // Wellhead markers
+      const whGeo = new THREE.CylinderGeometry(casingRadii[0] * 1.5, casingRadii[0] * 1.5, 0.04, 12);
+      const whIn = new THREE.Mesh(whGeo, matInlet);
+      whIn.position.set(-vertSepLocal, 0.02, 0);
+      scene.add(whIn);
+      const whOut = new THREE.Mesh(whGeo, matOutlet);
+      whOut.position.set(vertSepLocal, 0.02, 0);
+      scene.add(whOut);
+
+      // Laterals fan out, connect toe-to-toe
+      for (let i = 0; i < nPairs; i++) {
+        const angle = nPairs === 1 ? 0 : -fanAngle + (2 * fanAngle * i) / (nPairs - 1);
+        const toeX = ll * Math.cos(angle);
+        const toeZ = ll * Math.sin(angle);
+
+        const lowerY = -inletDepth;
+        const upperY = -outletDepth;
+        const kickLen = 0.15;
+
+        // Lower lateral from inlet
+        const kickPt = new THREE.Vector3(
+          -vertSepLocal + kickLen * Math.cos(angle) * 0.3,
+          lowerY + kickLen * 0.05,
+          kickLen * Math.sin(angle) * 0.3
+        );
+        addTube(new THREE.Vector3(-vertSepLocal, lowerY, 0), kickPt, latR, matLateral);
+        addTube(kickPt, new THREE.Vector3(toeX, lowerY, toeZ), latR, matLateral);
+
+        // Upper lateral from outlet
+        const kickPtU = new THREE.Vector3(
+          vertSepLocal + kickLen * Math.cos(angle) * 0.3,
+          upperY - kickLen * 0.05,
+          kickLen * Math.sin(angle) * 0.3
+        );
+        addTube(new THREE.Vector3(vertSepLocal, upperY, 0), kickPtU, latR, matLateral);
+        addTube(kickPtU, new THREE.Vector3(toeX, upperY, toeZ), latR, matLateral);
+
+        // Toe-to-toe connection
+        addTube(new THREE.Vector3(toeX, lowerY, toeZ), new THREE.Vector3(toeX, upperY, toeZ), latR * 0.8, matJunction);
+        const jGeo = new THREE.SphereGeometry(latR * 1.8, 8, 8);
+        const jMesh = new THREE.Mesh(jGeo, matJunction);
+        jMesh.position.set(toeX, (lowerY + upperY) / 2, toeZ);
+        scene.add(jMesh);
+      }
+
+      // Pad marker
+      const padGeo = new THREE.CylinderGeometry(0.08, 0.08, 0.01, 16);
+      const padMesh = new THREE.Mesh(padGeo, new THREE.MeshPhongMaterial({ color: 0x888888 }));
+      padMesh.position.set(0, 0.005, 0);
+      scene.add(padMesh);
+
+      // Depth markers
+      for (let d = 1; d <= Math.floor(dp); d++) {
+        const tGeo = new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(-vertSepLocal - 0.08, -d, 0), new THREE.Vector3(-vertSepLocal + 0.08, -d, 0),
+        ]);
+        scene.add(new THREE.Line(tGeo, new THREE.LineBasicMaterial({ color: 0x999999 })));
+      }
+
+      // Surface plane & rock volume
+      const surfSize = Math.max(ll * 2.5, dp * 2);
+      const surfGeo = new THREE.PlaneGeometry(surfSize, surfSize);
+      const surfMesh = new THREE.Mesh(surfGeo, matSurface);
+      surfMesh.rotation.x = -Math.PI / 2;
+      scene.add(surfMesh);
+
+      const rockW = ll * 2.2, rockH = dp * 1.1, rockD = ll * 1.5;
+      const rockGeo = new THREE.BoxGeometry(rockW, rockH, rockD);
+      const rockMesh = new THREE.Mesh(rockGeo, matRock);
+      rockMesh.position.set(ll * 0.3, -dp / 2, 0);
+      scene.add(rockMesh);
+      const rockEdges = new THREE.EdgesGeometry(rockGeo);
+      const rockLine = new THREE.LineSegments(rockEdges, matWire);
+      rockLine.position.copy(rockMesh.position);
+      scene.add(rockLine);
+    }
+
+    // Lights
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(5, 10, 7);
+    scene.add(dirLight);
+
+    // Camera orbit
+    const m = mouseRef.current;
+    m.dist = Math.max(dp * 2, ll * 2);
+    m.tx = isUtube ? 0 : ll * 0.3;
+    m.ty = -dp / 2;
+
+    function updateCamera() {
+      const mm = mouseRef.current;
+      camera.position.set(
+        mm.dist * Math.sin(mm.phi) * Math.cos(mm.theta) + mm.tx,
+        mm.dist * Math.cos(mm.phi) + mm.ty,
+        mm.dist * Math.sin(mm.phi) * Math.sin(mm.theta)
+      );
+      camera.lookAt(mm.tx, mm.ty, 0);
+    }
+
+    // Mouse handlers
+    function onDown(e) {
+      const mm = mouseRef.current;
+      mm.down = true; mm.button = e.button; mm.ctrl = e.ctrlKey || e.metaKey; mm.x = e.clientX; mm.y = e.clientY;
+      e.preventDefault();
+    }
+    function onMove(e) {
+      const mm = mouseRef.current;
+      if (!mm.down) return;
+      const dx = e.clientX - mm.x, dy = e.clientY - mm.y;
+      mm.x = e.clientX; mm.y = e.clientY;
+      if (mm.button === 2 || (mm.button === 0 && mm.ctrl)) { // right-click or ctrl+click = pan
+        mm.tx += dx * mm.dist * 0.001;
+        mm.ty -= dy * mm.dist * 0.001;
+      } else if (mm.button === 0) { // orbit
+        mm.theta -= dx * 0.005;
+        mm.phi = Math.max(0.1, Math.min(Math.PI - 0.1, mm.phi - dy * 0.005));
+      }
+    }
+    function onUp() { mouseRef.current.down = false; }
+    function onWheel(e) {
+      const mm = mouseRef.current;
+      mm.dist = Math.max(1, Math.min(50, mm.dist * (1 + e.deltaY * 0.001)));
+      e.preventDefault();
+    }
+    function onContext(e) { e.preventDefault(); }
+
+    const el = renderer.domElement;
+    el.addEventListener('mousedown', onDown);
+    el.addEventListener('contextmenu', onContext);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    el.addEventListener('wheel', onWheel, { passive: false });
+
+    // Touch support
+    function onTouchStart(e) {
+      if (e.touches.length === 1) {
+        const mm = mouseRef.current;
+        mm.down = true; mm.button = 0; mm.x = e.touches[0].clientX; mm.y = e.touches[0].clientY;
+      }
+    }
+    function onTouchMove(e) {
+      if (e.touches.length === 1) {
+        onMove({ clientX: e.touches[0].clientX, clientY: e.touches[0].clientY });
+      }
+      e.preventDefault();
+    }
+    function onTouchEnd() { mouseRef.current.down = false; }
+    el.addEventListener('touchstart', onTouchStart, { passive: true });
+    el.addEventListener('touchmove', onTouchMove, { passive: false });
+    el.addEventListener('touchend', onTouchEnd);
+
+    // Animate
+    function animate() {
+      frameRef.current = requestAnimationFrame(animate);
+      updateCamera();
+      renderer.render(scene, camera);
+    }
+    animate();
+    sceneRef.current = { scene, camera, renderer };
+
+    // Resize
+    function onResize() {
+      const w = container.clientWidth, h = container.clientHeight || 600;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    }
+    window.addEventListener('resize', onResize);
+
+    return () => {
+      cancelAnimationFrame(frameRef.current);
+      el.removeEventListener('mousedown', onDown);
+      el.removeEventListener('contextmenu', onContext);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('touchstart', onTouchStart);
+      el.removeEventListener('touchmove', onTouchMove);
+      el.removeEventListener('touchend', onTouchEnd);
+      window.removeEventListener('resize', onResize);
+      renderer.dispose();
+    };
+  }, [params.depthVertical, params.lateralLength, params.numLaterals, params.architecture]);
+
+  const dp = params.depthVertical, ll = params.lateralLength, nl = params.numLaterals;
+  const nPairs = Math.ceil(nl / 2);
+  const TrockDepth = params.surfaceTemp + (params.geoGradient / 1000) * dp;
+  const pairLen = (ll * 2) / 1000; // each pair: two lateral legs (shared motherbores)
+  const totalDrilled = (dp * 2 + ll * nl) / 1000; // 2 motherbores + all laterals
+
+  return (
+    <div className="h-full flex flex-col">
+      <div className="bg-white border border-gray-200 flex-1 flex flex-col">
+        <div className="bg-gray-100 px-3 py-1.5 border-b border-gray-200 flex justify-between items-center">
+          <h3 className="text-gray-700 font-semibold text-xs uppercase">
+            Wellbore Geometry — {params.architecture === 'utube' ? 'U-Tube (Separated Pads)' : 'Co-located (Stacked Toe-to-Toe)'}
+          </h3>
+          <div className="flex items-center gap-3 text-xs text-gray-400">
+            <span>Drag: orbit</span>
+            <span>Scroll: zoom</span>
+            <span>Ctrl+drag / right-drag: pan</span>
+          </div>
+        </div>
+        <div ref={mountRef} className="flex-1" style={{minHeight: 500}} />
+      </div>
+      <div className="mt-2 grid grid-cols-5 gap-2">
+        {[
+          { label: 'Vertical Depth', value: `${dp.toLocaleString()}m` },
+          { label: 'Lateral Pairs', value: `${nPairs} pairs × ${ll.toLocaleString()}m` },
+          { label: 'Per Pair', value: `${pairLen.toFixed(1)} km lateral` },
+          { label: 'Total Drilled', value: `${totalDrilled.toFixed(1)} km` },
+          { label: 'Rock at Depth', value: `${TrockDepth.toFixed(0)}°C` },
+        ].map((c, i) => (
+          <div key={i} className="bg-white border border-gray-200 px-3 py-2">
+            <div className="text-gray-400 text-xs uppercase">{c.label}</div>
+            <div className="font-semibold text-sm text-gray-700">{c.value}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// =============================================================
+// MAIN APP
+// =============================================================
+
+function GeothermalSimulator() {
+  const [mainTab, setMainTab] = useState('simulator');
+  const [systemType, setSystemType] = useState('closedloop'); // 'closedloop' or 'egs'
+  const [activePreset, setActivePreset] = useState('eavor_lite');
+  const [location, setLocation] = useState('alberta');
+  const [params, setParams] = useState({ ...PRESETS.eavor_lite, ambientTemp: 5 });
+  const [chartTab, setChartTab] = useState('temperature');
+
+  const loc = LOCATIONS.find(l => l.id === location) || LOCATIONS[0];
+
+  // Build full params with surfaceTemp from location
+  const fullParams = useMemo(() => ({ ...params, surfaceTemp: loc.surfaceTemp, seasonalAmp: loc.seasonalAmp }), [params, loc]);
+
+  function loadPreset(key) {
+    setActivePreset(key);
+    const p = PRESETS[key];
+    if (p.systemType) setSystemType(p.systemType);
+    const pLoc = LOCATIONS.find(l => l.id === p.location) || LOCATIONS[0];
+    setLocation(p.location);
+    setParams({ ...p, ambientTemp: pLoc.ambientTemp });
+  }
+  function switchSystemType(type) {
+    setSystemType(type);
+    // Load first preset of that type
+    const firstKey = Object.keys(PRESETS).find(k => PRESETS[k].systemType === type);
+    if (firstKey) loadPreset(firstKey);
+  }
+  function updateParam(key, val) { const n = parseFloat(val); if (!isNaN(n)) setParams(prev => ({ ...prev, [key]: n })); }
+  function changeLocation(locId) {
+    setLocation(locId);
+    const newLoc = LOCATIONS.find(l => l.id === locId) || LOCATIONS[0];
+    setParams(prev => ({ ...prev, ambientTemp: newLoc.ambientTemp }));
+  }
+
+  // Auto-compute on param change
+  const results = useMemo(() => systemType === 'egs' ? runEGSSimulation(fullParams) : runSimulation(fullParams), [fullParams, systemType]);
+
+  const PARAM_CONFIG = systemType === 'egs' ? PARAM_CONFIG_EGS : PARAM_CONFIG_CLOSED;
+  const filteredPresets = Object.keys(PRESETS).filter(k => PRESETS[k].systemType === systemType);
+
+  const fmt = (v, d = 1) => v != null ? Number(v).toFixed(d) : '—';
+  const last = results[results.length - 1];
+  const peakTemp = Math.max(...results.map(r => r.outletTemp));
+  const peakDay = results.find(r => r.outletTemp === peakTemp);
+  const avgThermal = results.reduce((s, d) => s + d.thermalMW, 0) / results.length;
+  const avgElec = results.reduce((s, d) => s + d.netElectricMW, 0) / results.length;
+  const TrockDepth = loc.surfaceTemp + (params.geoGradient / 1000) * params.depthVertical;
+
+  // EGS field-level rollup
+  const egsNProd = (params.numProducers || 2) * (params.numBenches || 1);
+  const egsNInj = (params.numInjectors || 3) * (params.numBenches || 1);
+  const egsTotalWells = egsNProd + egsNInj;
+  const egsFieldMWe = last ? last.netElectricMW * egsNProd : 0;
+  const egsAvgFieldMWe = avgElec * egsNProd;
+
+  const chartTabs = [{ id: 'temperature', label: 'Temperature' }, { id: 'power', label: 'Power' }];
+  const mainTabs = [{ id: 'simulator', label: 'Simulator' }, { id: '3d', label: '3D Viewer' }, { id: 'model', label: 'Model Architecture' }];
+
+  return (
+    <div className="min-h-screen bg-gray-100 text-gray-800 font-sans text-sm">
+      <style>{`
+        input[type=range]{-webkit-appearance:none;width:100%;height:3px;background:#e5e7eb;border-radius:2px;outline:none}
+        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#53BD2E;cursor:pointer;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+        input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:#53BD2E;cursor:pointer;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+      `}</style>
+
+      {/* Sticky top */}
+      <div className="sticky top-0 z-50">
+        {/* Header */}
+        <div style={{background:'#F79130'}} className="text-white px-3 py-2 flex items-center justify-between shadow-md">
+          <div className="flex items-center gap-3">
+            <span className="font-semibold text-sm">{systemType === 'egs' ? 'Enhanced Geothermal (EGS)' : 'Closed-Loop Geothermal'} Simulator</span>
+            <span className="text-white text-opacity-60 text-xs hidden sm:inline">|</span>
+            <span className="text-white text-opacity-80 text-xs hidden sm:inline">Enverus Intelligence<sup>&reg;</sup> Research</span>
+          </div>
+          <div className="flex items-center gap-0.5 bg-white bg-opacity-20 rounded-full p-0.5">
+            <button onClick={() => switchSystemType('closedloop')}
+              className={`px-3 py-1 text-xs rounded-full font-medium transition-all ${systemType === 'closedloop' ? 'bg-white text-orange-600 shadow-sm' : 'text-white text-opacity-80 hover:text-opacity-100'}`}>
+              Closed-Loop
+            </button>
+            <button onClick={() => switchSystemType('egs')}
+              className={`px-3 py-1 text-xs rounded-full font-medium transition-all ${systemType === 'egs' ? 'bg-white text-orange-600 shadow-sm' : 'text-white text-opacity-80 hover:text-opacity-100'}`}>
+              EGS
+            </button>
+          </div>
+        </div>
+        {/* Tabs */}
+        <div className="bg-white border-b border-gray-300 px-3 overflow-x-auto">
+          <div className="flex items-center gap-1">
+            {mainTabs.map(tab => (
+              <button key={tab.id} onClick={() => setMainTab(tab.id)}
+                style={mainTab === tab.id ? {borderColor:'#53BD2E',color:'#53BD2E',backgroundColor:'#53BD2E15'} : {}}
+                className={`px-4 py-2 text-xs font-medium border-b-2 transition-colors whitespace-nowrap ${mainTab === tab.id ? '' : 'border-transparent text-gray-600 hover:text-gray-800 hover:bg-gray-50'}`}>
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        {/* Live metrics */}
+        <div className="bg-white border-b border-gray-200 px-3 py-1.5 flex items-center gap-4 text-xs overflow-x-auto">
+          <span className="text-gray-400 font-medium" style={{minWidth:28}}>Live</span>
+          <div className="flex items-center gap-1"><span className="text-gray-400">Rock T:</span><span className="font-semibold text-gray-700">{fmt(TrockDepth,0)}°C</span></div>
+          {systemType === 'egs' ? (
+            <>
+            <div className="flex items-center gap-1"><span className="text-gray-400">Pattern:</span><span className="font-semibold text-gray-700">{params.numInjectors||3}I / {params.numProducers||2}P × {params.numBenches||1}B</span></div>
+            <div className="flex items-center gap-1"><span className="text-gray-400">Wells:</span><span className="font-semibold text-gray-700">{egsTotalWells} ({egsNInj}I+{egsNProd}P)</span></div>
+            <span className="text-gray-200">|</span>
+            <div className="flex items-center gap-1"><span className="text-gray-400">Initial:</span><span className="font-semibold" style={{color:'#53BD2E'}}>{fmt(results[Math.min(5,results.length-1)]?.netElectricMW,1)} MWe</span></div>
+            <div className="flex items-center gap-1"><span className="text-gray-400">Yr {params.years}:</span><span className="font-semibold text-gray-700">{fmt(last?.netElectricMW,1)} MWe</span></div>
+            <span className="text-gray-200">|</span>
+            <div className="flex items-center gap-1"><span className="text-gray-400">{params.years}yr avg:</span><span className="font-semibold" style={{color:'#53BD2E'}}>{fmt(avgElec,1)} MWe/well</span></div>
+            <div className="flex items-center gap-1"><span className="text-gray-400">Field avg:</span><span className="font-semibold" style={{color:'#F79130'}}>{fmt(egsAvgFieldMWe,1)} MWe</span></div>
+            <span className="text-gray-200">|</span>
+            <div className="flex items-center gap-1"><span className="text-gray-400">Pump/well:</span><span className="font-semibold text-gray-700">{fmt(last?.pumpMW,2)} MW</span></div>
+            </>
+          ) : (
+            <>
+            <div className="flex items-center gap-1"><span className="text-gray-400">Flow/lat:</span><span className="font-semibold text-gray-700">{fmt(params.flowRate/params.numLaterals,2)} kg/s</span></div>
+            <span className="text-gray-200">|</span>
+            <div className="flex items-center gap-1"><span className="text-gray-400">Peak:</span><span className="font-semibold" style={{color:'#53BD2E'}}>{fmt(peakTemp)}°C</span></div>
+            <div className="flex items-center gap-1"><span className="text-gray-400">Final:</span><span className="font-semibold text-gray-700">{fmt(last?.outletTemp)}°C</span></div>
+            <span className="text-gray-200">|</span>
+            <div className="flex items-center gap-1"><span className="text-gray-400">Avg MWth:</span><span className="font-semibold" style={{color:'#53BD2E'}}>{fmt(avgThermal,2)}</span></div>
+            <div className="flex items-center gap-1"><span className="text-gray-400">Avg MWe:</span><span className="font-semibold text-gray-700">{fmt(avgElec,3)}</span></div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* SIMULATOR TAB */}
+      {mainTab === 'simulator' && (
+        <div className="flex" style={{minHeight:'calc(100vh - 110px)'}}>
+          {/* Sidebar */}
+          <div className="bg-white border-r border-gray-200 overflow-y-auto" style={{width:270,minWidth:270}}>
+            <div className="px-3 pt-3 pb-2">
+              <div className="text-gray-400 font-semibold text-xs uppercase mb-2">Presets</div>
+              <div className="flex flex-wrap gap-1">
+                {filteredPresets.map(key => (
+                  <button key={key} onClick={() => loadPreset(key)}
+                    className={`px-2 py-1 text-xs rounded border transition-colors ${activePreset === key ? 'font-semibold' : 'text-gray-500 hover:text-gray-700'}`}
+                    style={activePreset === key ? {borderColor:'#53BD2E',color:'#53BD2E',background:'#53BD2E10'} : {borderColor:'#e5e7eb'}}>
+                    {PRESETS[key].label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="px-3 pb-3">
+              <div className="text-gray-400 font-semibold text-xs uppercase mb-2">Location</div>
+              <select value={location} onChange={(e) => changeLocation(e.target.value)}
+                className="w-full border border-gray-300 rounded px-2 py-1.5 text-xs bg-white text-gray-700 mb-1 focus:outline-none focus:border-green-600">
+                {LOCATIONS.map(l => <option key={l.id} value={l.id}>{l.label}</option>)}
+              </select>
+              <div className="flex justify-between text-xs text-gray-400 px-0.5">
+                <span>Mean surface: {loc.surfaceTemp}°C</span>
+                <span>Rock at depth: {fmt(TrockDepth, 0)}°C</span>
+              </div>
+            </div>
+            <div className="px-3 pb-3">
+              <div className="text-gray-400 font-semibold text-xs uppercase mb-2">Parameters</div>
+              {PARAM_CONFIG.map(p => (
+                <div key={p.key} className="mb-2.5">
+                  <div className="flex justify-between mb-0.5">
+                    <span className="text-gray-600 text-xs">{p.label}</span>
+                    <span className="text-xs font-mono font-semibold" style={{color:'#53BD2E'}}>{params[p.key]}{p.unit ? ` ${p.unit}` : ''}</span>
+                  </div>
+                  <input type="range" min={p.min} max={p.max} step={p.step} value={params[p.key]} onChange={(e) => updateParam(p.key, e.target.value)} />
+                </div>
+              ))}
+            </div>
+            {(() => {
+              // Hydraulics calculations
+              const rw = params.wellboreRadius, A = Math.PI * rw * rw, D = 2 * rw;
+              const rho = 1000, mu = 0.55e-3; // water ~50°C
+              const v = params.flowRate / (rho * A);
+              const Re = rho * v * D / mu;
+              const f = Re < 2300 ? 64 / Re : 0.316 * Math.pow(Re, -0.25);
+              const dP_per_km = f * (1000 / D) * 0.5 * rho * v * v; // Pa/km
+              const dP_bar_km = dP_per_km / 1e5;
+              // Total loop: 2 verticals + laterals
+              const totalLength = 2 * params.depthVertical + params.lateralLength * params.numLaterals;
+              const dP_total_bar = dP_bar_km * totalLength / 1000;
+              const dP_total_psi = dP_total_bar * 14.504;
+              // Pump power: dP * Q / efficiency
+              const Q_m3s = params.flowRate / rho;
+              const pumpPower_kW = (dP_total_bar * 1e5 * Q_m3s) / 0.75 / 1000; // 75% pump eff
+
+              const velColor = v > 3 ? '#C04151' : v > 2 ? '#F79130' : '#53BD2E';
+              const velStatus = v > 3 ? 'EROSION RISK' : v > 2 ? 'HIGH' : 'OK';
+              const dInches = D * 39.37;
+
+              return (
+                <div className="mx-3 mb-3">
+                  <div className="bg-gray-50 border border-gray-200 rounded text-xs">
+                    <div className="bg-gray-100 px-2 py-1 border-b border-gray-200">
+                      <span className="text-gray-500 font-semibold uppercase" style={{fontSize: 10}}>Hydraulics</span>
+                    </div>
+                    <div className="p-2 space-y-1">
+                      <div className="flex justify-between">
+                        <span className="text-gray-500">Casing ID</span>
+                        <span className="font-mono text-gray-700">{(D*1000).toFixed(0)} mm ({dInches.toFixed(1)}")</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-gray-500">Velocity</span>
+                        <span className="font-mono font-semibold" style={{color: velColor}}>{v.toFixed(2)} m/s <span style={{fontSize: 9}}>({velStatus})</span></span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-gray-500">Reynolds</span>
+                        <span className="font-mono text-gray-700">{Re >= 1e6 ? (Re/1e6).toFixed(2)+'M' : Re >= 1000 ? Math.round(Re/1000)+'k' : Math.round(Re)}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-gray-500">Friction dP</span>
+                        <span className="font-mono text-gray-700">{dP_bar_km.toFixed(2)} bar/km</span>
+                      </div>
+                      <div className="border-t border-gray-200 pt-1 mt-1">
+                        <div className="flex justify-between">
+                          <span className="text-gray-500">Loop length</span>
+                          <span className="font-mono text-gray-700">{(totalLength/1000).toFixed(1)} km</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-500">Total dP</span>
+                          <span className="font-mono font-semibold text-gray-800">{dP_total_bar.toFixed(1)} bar ({dP_total_psi.toFixed(0)} psi)</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-500">Pump power</span>
+                          <span className="font-mono text-gray-700">{pumpPower_kW.toFixed(1)} kW</span>
+                        </div>
+                      </div>
+                      {v > 2 && (
+                        <div className="border-t border-gray-200 pt-1 mt-1 text-center" style={{color: velColor, fontSize: 10}}>
+                          ⚠ {v > 3 ? 'Velocity exceeds 3 m/s erosion limit' : 'Approaching erosion limit (>2 m/s)'}
+                          <br/>Min radius for 2 m/s: {Math.sqrt(params.flowRate / (rho * 2.0 * Math.PI)).toFixed(3)} m
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="mt-2 p-2 bg-gray-50 border border-gray-200 rounded text-xs text-gray-500 leading-relaxed">
+                    1 inlet → {params.numLaterals} laterals → 1 outlet<br/>
+                    Flow/lat: {fmt(params.flowRate/params.numLaterals,2)} kg/s<br/>
+                    Surface (rock): {loc.surfaceTemp}°C · Rock at depth: {fmt(TrockDepth,0)}°C<br/>
+                    Ambient: {params.ambientTemp}°C ± {loc.seasonalAmp}°C seasonal<br/>
+                    ORC rejection: {params.ambientTemp - loc.seasonalAmp + 10}–{params.ambientTemp + loc.seasonalAmp + 10}°C
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* Main content */}
+          <div className="flex-1 overflow-y-auto p-3">
+            {/* Metric cards */}
+            <div className="mb-3">
+              {systemType === 'egs' ? (
+                <>
+                {/* Single well hero card */}
+                <div className="bg-white border border-gray-200 p-3 mb-2">
+                  <div className="text-gray-400 text-xs uppercase font-semibold mb-2">Single Producer Well — Net Electric Output</div>
+                  <div className="flex items-end gap-6">
+                    <div>
+                      <div className="text-gray-400" style={{fontSize:10}}>Initial</div>
+                      <div className="font-bold text-2xl" style={{color:'#53BD2E'}}>{fmt(results[Math.min(5,results.length-1)]?.netElectricMW,1)}<span className="text-sm font-semibold ml-0.5">MWe</span></div>
+                      <div className="text-gray-400" style={{fontSize:10}}>gross {fmt(results[Math.min(5,results.length-1)]?.grossElectricMW,1)} − pump {fmt(last?.pumpMW,1)}</div>
+                    </div>
+                    <div className="text-gray-300 text-lg pb-1">→</div>
+                    <div>
+                      <div className="text-gray-400" style={{fontSize:10}}>{params.years}-yr Average</div>
+                      <div className="font-bold text-2xl" style={{color:'#F79130'}}>{fmt(avgElec,1)}<span className="text-sm font-semibold ml-0.5">MWe</span></div>
+                      <div className="text-gray-400" style={{fontSize:10}}>{fmt(avgThermal,1)} MWth</div>
+                    </div>
+                    <div className="text-gray-300 text-lg pb-1">→</div>
+                    <div>
+                      <div className="text-gray-400" style={{fontSize:10}}>Year {params.years}</div>
+                      <div className="font-bold text-2xl text-gray-500">{fmt(last?.netElectricMW,1)}<span className="text-sm font-semibold ml-0.5">MWe</span></div>
+                      <div className="text-gray-400" style={{fontSize:10}}>{fmt(last?.outletTemp,0)}°C outlet</div>
+                    </div>
+                    <div className="border-l border-gray-200 pl-6 ml-2">
+                      <div className="text-gray-400" style={{fontSize:10}}>Flow rate</div>
+                      <div className="font-semibold text-sm text-gray-700">{params.flowRate} kg/s</div>
+                      <div className="text-gray-400" style={{fontSize:10}}>{Math.floor((params.lateralLength||1430)/(params.clusterSpacing||9))} stages × {((params.clusterSpacing||9)*3.281).toFixed(0)} ft spacing</div>
+                    </div>
+                  </div>
+                </div>
+                {/* Field summary row */}
+                <div className="grid grid-cols-4 gap-2">
+                  {[
+                    {label:'Well Pattern',value:`${params.numInjectors||3}I / ${params.numProducers||2}P`,sub:`per bench × ${params.numBenches||1} bench${(params.numBenches||1)>1?'es':''}`},
+                    {label:'Total Wells',value:`${egsTotalWells}`,sub:`${egsNInj} injectors + ${egsNProd} producers`},
+                    {label:`Field Avg (${params.years}yr)`,value:`${fmt(egsAvgFieldMWe,0)} MWe`,sub:`${egsNProd} producers × ${fmt(avgElec,1)} MWe`},
+                    {label:'Pump Parasitic',value:`${fmt((last?.pumpMW||0)*egsNProd,1)} MW`,sub:`${fmt(last?.pumpMW,2)} MW/well × ${egsNProd} prod`},
+                  ].map((c,i) => (
+                    <div key={i} className="bg-white border border-gray-200 px-3 py-2">
+                      <div className="text-gray-400 text-xs uppercase">{c.label}</div>
+                      <div className="font-semibold text-sm text-gray-700">{c.value}</div>
+                      {c.sub && <div className="text-gray-400" style={{fontSize:10}}>{c.sub}</div>}
+                    </div>
+                  ))}
+                </div>
+                </>
+              ) : (
+                <div className="grid grid-cols-4 gap-2">
+                  {[
+                    {label:'Peak Outlet',value:`${fmt(peakTemp)}°C`,sub:`day ${peakDay ? fmt(peakDay.days,0) : '?'}`},
+                    {label:'Final Outlet',value:`${fmt(last?.outletTemp)}°C`,sub:`yr ${fmt(last?.year)}`},
+                    {label:'Avg Thermal',value:`${fmt(avgThermal,2)} MWth`},
+                    {label:'Avg Electric',value:`${fmt(avgElec,3)} MWe`},
+                  ].map((c,i) => (
+                    <div key={i} className="bg-white border border-gray-200 px-3 py-2">
+                      <div className="text-gray-400 text-xs uppercase">{c.label}</div>
+                      <div className="font-semibold text-sm" style={{color:'#53BD2E'}}>{c.value}</div>
+                      {c.sub && <div className="text-gray-400" style={{fontSize:10}}>{c.sub}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Chart tabs */}
+            <div className="flex gap-1 mb-0">
+              {chartTabs.map(ct => (
+                <button key={ct.id} onClick={() => setChartTab(ct.id)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-t border border-b-0 transition-colors ${chartTab === ct.id ? 'bg-white text-gray-700 border-gray-200' : 'bg-gray-50 text-gray-400 border-transparent hover:text-gray-600'}`}>
+                  {ct.label}
+                </button>
+              ))}
+            </div>
+
+            {chartTab === 'temperature' && <ZoomChart data={results} title={systemType === 'egs' ? "Production Wellhead Temperature (°C) — per well" : "Outlet Wellhead Temperature (°C)"} lines={[{key:'outletTemp',name:'Outlet Wellhead',color:'#F79130',width:2},{key:'latExitTemp',name:systemType === 'egs' ? 'Fracture Exit' : 'Lateral Exit',color:'#53BD2E',width:1.5,dash:'5 3'}]} />}
+            {chartTab === 'power' && (systemType === 'egs' ? (
+              <ZoomChart data={results.map(r => ({...r,
+                fieldGrossMWe: Math.round((r.grossElectricMW || 0) * egsNProd * 100) / 100,
+                fieldNetMWe: Math.round(r.netElectricMW * egsNProd * 100) / 100,
+                fieldPumpMW: Math.round((r.pumpMW || 0) * egsNProd * 100) / 100,
+                fieldThMW: Math.round(r.thermalMW * egsNProd * 100) / 100,
+                timeLabel: r.timeLabel
+              }))} title={`Field Power Output (MW) — ${egsNProd} producers, ${egsTotalWells} wells total`} lines={[
+                {key:'fieldThMW',name:'Thermal MWth',color:'#53BD2E',width:1.5,dash:'5 3'},
+                {key:'fieldGrossMWe',name:'Gross Electric MWe',color:'#9ca3af',width:1.5,dash:'3 3'},
+                {key:'fieldNetMWe',name:'Net Electric MWe',color:'#F79130',width:2.5},
+                {key:'fieldPumpMW',name:'Pump Parasitic MW',color:'#C04151',width:1,dash:'4 2'},
+              ]} />
+            ) : (
+              <ZoomChart data={results} title="Power Output (MW)" lines={[{key:'thermalMW',name:'Thermal MWth',color:'#53BD2E',width:2},{key:'netElectricMW',name:'Net Electric MWe',color:'#F79130',width:2}]} />
+            ))}
+
+            {/* Data table */}
+            <div className="bg-white border border-gray-200">
+              <div className="bg-gray-100 px-3 py-1.5 border-b border-gray-200"><h3 className="text-gray-700 font-semibold text-xs uppercase">{systemType === 'egs' ? `Field Results — ${egsNProd} producers` : 'Results Data'}</h3></div>
+              <div className="overflow-x-auto p-1">
+                <table className="w-full" style={{borderCollapse:'collapse',fontSize:11}}>
+                  <thead><tr className="border-b border-gray-200">
+                    {systemType === 'egs' 
+                      ? ['Time','Well °C','Frac Exit °C','ΔT °C','ΔT %','Well MWe','Field MWth','Field Gross','Field Net','Pump MW'].map(h => <th key={h} className="px-2 py-1.5 text-right text-gray-500 font-medium text-xs">{h}</th>)
+                      : ['Time','Outlet °C','Lat Exit °C','ΔT °C','ΔT %','Loss °C','MWth','MWe'].map(h => <th key={h} className="px-2 py-1.5 text-right text-gray-500 font-medium text-xs">{h}</th>)
+                    }
+                  </tr></thead>
+                  <tbody>
+                    {(() => {
+                      const filtered = results.filter((_,i) => i % Math.max(Math.floor(results.length/20),1) === 0 || i === results.length-1);
+                      return filtered.map((row,i) => {
+                        const prevTemp = i === 0 ? row.outletTemp : filtered[i-1].outletTemp;
+                        const declineAbs = Math.round((prevTemp - row.outletTemp) * 100) / 100;
+                        const declinePct = prevTemp > 0 ? Math.round((prevTemp - row.outletTemp) / prevTemp * 10000) / 100 : 0;
+                        return (
+                      <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
+                        <td className="px-2 py-1 text-right text-gray-500 font-mono">{row.timeLabel}</td>
+                        <td className="px-2 py-1 text-right font-mono" style={{color:'#F79130'}}>{row.outletTemp}</td>
+                        <td className="px-2 py-1 text-right font-mono" style={{color:'#53BD2E'}}>{row.latExitTemp}</td>
+                        {systemType === 'egs' ? (<>
+                          <td className="px-2 py-1 text-right font-mono" style={{color: declineAbs > 0 ? '#C04151' : '#53BD2E'}}>{i === 0 ? '—' : declineAbs > 0 ? `−${fmt(declineAbs,1)}` : `+${fmt(Math.abs(declineAbs),1)}`}</td>
+                          <td className="px-2 py-1 text-right font-mono" style={{color: declinePct > 0 ? '#C04151' : '#53BD2E'}}>{i === 0 ? '—' : declinePct > 0 ? `−${fmt(declinePct,2)}%` : `+${fmt(Math.abs(declinePct),2)}%`}</td>
+                          <td className="px-2 py-1 text-right font-mono text-gray-600">{row.netElectricMW}</td>
+                          <td className="px-2 py-1 text-right font-mono text-gray-600">{fmt(row.thermalMW * egsNProd,1)}</td>
+                          <td className="px-2 py-1 text-right font-mono text-gray-500">{fmt((row.grossElectricMW||0) * egsNProd,1)}</td>
+                          <td className="px-2 py-1 text-right font-mono" style={{color:'#F79130'}}>{fmt(row.netElectricMW * egsNProd,1)}</td>
+                          <td className="px-2 py-1 text-right font-mono" style={{color:'#C04151'}}>{fmt((row.pumpMW||0) * egsNProd,2)}</td>
+                        </>) : (<>
+                          <td className="px-2 py-1 text-right font-mono" style={{color: declineAbs > 0 ? '#C04151' : '#53BD2E'}}>{i === 0 ? '—' : declineAbs > 0 ? `−${fmt(declineAbs,1)}` : `+${fmt(Math.abs(declineAbs),1)}`}</td>
+                          <td className="px-2 py-1 text-right font-mono" style={{color: declinePct > 0 ? '#C04151' : '#53BD2E'}}>{i === 0 ? '—' : declinePct > 0 ? `−${fmt(declinePct,2)}%` : `+${fmt(Math.abs(declinePct),2)}%`}</td>
+                          <td className="px-2 py-1 text-right font-mono" style={{color:'#C04151'}}>{row.outletVertLoss}</td>
+                          <td className="px-2 py-1 text-right font-mono text-gray-600">{row.thermalMW}</td>
+                          <td className="px-2 py-1 text-right font-mono font-semibold text-gray-800">{row.netElectricMW}</td>
+                        </>)}
+                      </tr>
+                        );
+                      });
+                    })()}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 3D VIEWER TAB */}
+      {mainTab === '3d' && (
+        <div className="p-3" style={{height:'calc(100vh - 110px)'}}>
+          <WellboreViewer3D params={fullParams} />
+        </div>
+      )}
+
+      {/* MODEL ARCHITECTURE TAB */}
+      {mainTab === 'model' && (
+        <div className="p-3">
+          <ModelArchitecture params={fullParams} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(React.createElement(GeothermalSimulator));
+  </script>
+</body>
+</html>
